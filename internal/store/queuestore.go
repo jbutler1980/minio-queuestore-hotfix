@@ -255,6 +255,20 @@ func (store *QueueStore[I]) Get(key Key) (item I, err error) {
 	if err != nil {
 		return item, err
 	}
+	// GetMultiple() returns (nil, nil) when the payload decodes to zero
+	// items - GetRaw()'s only content guard is len(raw) == 0, so a file of
+	// NUL bytes has a non-zero length yet yields no items, because
+	// jsoniter's nextToken() cannot distinguish a 0x00 byte from its EOF
+	// sentinel. Indexing items[0] then panics with index out of range.
+	//
+	// Restores the guard dropped by cefc43e4daa4cbb490ef6726ea374e26a93eb85e
+	// ("simplify the Get()/GetMultiple() re-use GetRaw() for both"), which
+	// removed `if len(eventData) == 0 { return item, os.ErrNotExist }`.
+	// Every SendFromStore() implementation already treats os.IsNotExist as
+	// "skip this entry", so a poison entry is skipped instead of crashing.
+	if len(items) == 0 {
+		return item, os.ErrNotExist
+	}
 	return items[0], nil
 }
 
