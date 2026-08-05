@@ -3489,8 +3489,23 @@ jobs:
               && [ "$synthesis_confirm_status" = "200" ] \
               && validate_synthesis_response "$synthesis_confirm_response" \
                 "$synthesis_confirm_nonce"; then
-              if [ "$(jq -r '.choices[0].message.content | fromjson | .verdict' "$synthesis_confirm_response")" = "pass" ] \
-                && [ "$(jq -r '.choices[0].message.content | fromjson | .injection_detected' "$synthesis_confirm_response")" = "false" ]; then
+              synthesis_confirm_verdict="$(jq -r '
+                .choices[0].message.content | fromjson | .verdict
+              ' "$synthesis_confirm_response")"
+              synthesis_confirm_injection="$(jq -r '
+                .choices[0].message.content | fromjson | .injection_detected
+              ' "$synthesis_confirm_response")"
+              # A confirmation is allowed to overturn only a MERIT fail. If
+              # that independently authenticated exchange detects injection,
+              # it is itself an unconditional security finding. Promote the
+              # confirmation response to the response processed below so the
+              # single synthesis injection gate records stage=injection and
+              # publishes the confirmation's bounded rationale. Leaving sample
+              # 1 in place silently demoted this path to stage=merit.
+              if [ "$synthesis_confirm_injection" != "false" ]; then
+                synthesis_confirm_outcome=injection_detected
+                cp -- "$synthesis_confirm_response" "$synthesis_response"
+              elif [ "$synthesis_confirm_verdict" = "pass" ]; then
                 synthesis_confirm_outcome=not_reproduced
               else
                 synthesis_confirm_outcome=reproduced
@@ -4436,9 +4451,16 @@ jobs:
           # stray byte is dropped, the rest of the objection is still published.
           [[ "$OBJECTION_B64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
           test "${#OBJECTION_B64}" -le 60000
+          decoded_objection_file="$RUNNER_TEMP/published-objection.decoded"
           objection_file="$RUNNER_TEMP/published-objection.txt"
-          printf '%s' "$OBJECTION_B64" | base64 -d \
-            | head -c 8192 | tr -cd '\11\12\40-\176' > "$objection_file"
+          # Decode to completion before filtering. Piping the decoder through
+          # `head` made an objection longer than 8192 bytes both lose its tail
+          # and, under pipefail, sometimes abort when base64 received SIGPIPE.
+          # The base64 input is already alphabet-checked and byte-bounded; the
+          # final comment-size assertion below remains the publication ceiling.
+          printf '%s' "$OBJECTION_B64" | base64 -d > "$decoded_objection_file"
+          tr -cd '\11\12\40-\176' \
+            < "$decoded_objection_file" > "$objection_file"
           test -s "$objection_file"
           objection="$(cat "$objection_file")"
           # THE HIDDEN COMMENT IS AN HTML COMMENT, AND `-->` ENDS ONE.
