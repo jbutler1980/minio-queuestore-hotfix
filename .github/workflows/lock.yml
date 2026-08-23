@@ -15,10 +15,25 @@ jobs:
   action:
     runs-on: ubuntu-latest
     steps:
-      - uses: dessant/lock-threads@v3
+      # v3/v4/v5 validate `github-token` with Joi `.max(100)`. The GitHub Actions
+      # token is now longer than 100 characters, so those versions reject it
+      # before doing any work:
+      #   ##[error]"github-token" length must be less than or equal to 100 characters long
+      # v6.0.0 raised the bound to .max(1000). Pinned by commit SHA (tag v6.0.2).
+      - uses: dessant/lock-threads@89ae32b08ed1a541efecbab17912962a5e38981c # v6.0.2
         with:
           github-token: ${{ github.token }}
           issue-inactive-days: '365'
           exclude-any-issue-labels: 'do-not-close'
           issue-lock-reason: 'resolved'
           log-output: true
+          # With `process-only` unset the action locks issues, pull requests AND
+          # discussions -- src/index.js: `threadTypes = processOnly || ['issue',
+          # 'pr', 'discussion']` -- and `pr-inactive-days` defaults to 365 in
+          # action.yml, so the pr pass runs whether or not this workflow asks for
+          # it. That pass needs `pull-requests: write`, which `permissions:` above
+          # does not grant, so it would fail the moment the token-version fix above lets
+          # the action reach it. Every input this workflow sets is an issue-*
+          # input, so the honest fix is to narrow the action to what the granted
+          # permission covers rather than widen the permission.
+          process-only: issues
