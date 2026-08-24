@@ -36,8 +36,31 @@ on:
 
 permissions: {}
 
+# A SKIPPED EVENT MUST NOT CANCEL A RUNNING REVIEW, AND THE JOB GUARD CANNOT
+# STOP IT.
+#
+# The guard above is evaluated on the JOB. `concurrency` is evaluated on the
+# WORKFLOW, before any job is considered, so a title edit reached
+# `cancel-in-progress` first: it killed a review that was already running and
+# already billed, and the run it started in its place then skipped and did no
+# work. Anyone who can edit a pull request title could therefore delete a
+# review at will -- and repeatedly. Measured on GitHub rather than reasoned
+# about (ci-loop-sandbox pull 7, 2026-08-24): with a plain PR-number group the
+# in-flight run ends `cancelled` and its replacement ends `skipped`.
+#
+# So the GROUP now depends on whether this event will do any work. An `edited`
+# without `changes.base` -- exactly the set the job guard skips -- is given a
+# DIFFERENT group, where it can only ever cancel other no-op runs. Everything
+# else keeps the single per-pull-request group, so a new push still supersedes
+# the review it obsoletes, which is what `cancel-in-progress` is FOR. Same
+# measurement, same pull request: with this group the in-flight run survives
+# the title edit and is still cancelled by the next `synchronize`.
+#
+# The condition is spelled the same way as the job guard, and
+# tests/test_canonical_pr_review_hardening.py binds the two to each other, so
+# one cannot be narrowed without the other.
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
+  group: claude-review-${{ github.event.pull_request.number }}${{ (github.event.action == 'edited' && github.event.changes.base == null) && '-skipped-edit' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -95,12 +118,27 @@ jobs:
       # captured in an assignment under `set -euo pipefail` a non-zero curl
       # aborts the step. An unreadable switch is therefore treated as ENGAGED,
       # never as "off, proceed" -- the direction a kill switch has to fail.
+      #
+      # THE RETRY WINDOW IS BOUNDED BY THIS WORKFLOW, NOT BY THE SERVER.
+      #
+      # `--max-time 15` bounds ONE attempt and RESTARTS on the next, so with
+      # `--retry 2` and nothing else the total is whatever the answering party
+      # chooses: curl honours `Retry-After`, and a 503 carrying a large one
+      # simply parks the runner. Measured with real curl against a real server
+      # answering `503 Retry-After: 20`: 40.05s with these flags as they stood,
+      # 20.04s with the window set. `--retry-max-time 60` bounds when a NEW
+      # attempt may START, so the worst case is 60s of window plus the 15s of
+      # the attempt already in flight -- 75s, from a value in this file rather
+      # than from a header. It bounds ONLY the retry window: a first attempt
+      # still runs, and a short `Retry-After` inside the window is still
+      # honoured and still retried, so nothing transient becomes fatal that was
+      # not fatal before.
       - name: Enforce global kill switch
         run: |
           set -euo pipefail
           state="$(curl --fail --silent --show-error --location \
             --proto '=https' --proto-redir '=https' --max-redirs 2 \
-            --max-time 15 --retry 2 \
+            --max-time 15 --retry 2 --retry-max-time 60 \
             https://raw.githubusercontent.com/jbutler1980/agent-ops-flags/main/state \
             | tr -d '[:space:]')"
           test "$state" = "on"
@@ -1364,7 +1402,29 @@ jobs:
           # DIAGNOSTIC ONLY: nothing downstream may treat it as authority, and
           # the merge gate remains `verdict == pass` over the hash-bound
           # response manifest, which no failure path can produce.
-          FAILURE_STAGE_RECORDED=0
+          # THE FIRST-WRITER-WINS SENTINEL IS A FILE, AND IT HAS TO BE.
+          #
+          # It was a shell variable, and `call_models` is invoked as
+          # `http_status="$(call_models ...)"` at both of its call sites. A
+          # command substitution is a SUBSHELL: `assert_kill_switch_on` named
+          # `kill-switch` inside it, set the variable inside it, and the
+          # variable died with the subshell. The caller then saw the sentinel
+          # still 0 and recorded its own, wronger stage -- and because
+          # $GITHUB_OUTPUT is APPENDED to and GitHub keeps the LAST value for a
+          # repeated key, the file ended up carrying both and the operator was
+          # told `chunk-transport`. A run somebody CANCELLED was reported as a
+          # broken model endpoint, which is the opposite investigation.
+          #
+          # A file crosses the subshell boundary, exactly as OBJECTION_FILE
+          # already does for the same structural reason. The claim is made with
+          # `set -o noclobber` inside a subshell of its own, so the create is
+          # the test: whoever creates it first is the first writer, and every
+          # later caller -- in this shell or any subshell of it -- returns
+          # without writing. Ordering, the symlink refusal and the
+          # unset-$GITHUB_OUTPUT early return are all unchanged; only the
+          # LIFETIME of the sentinel changes.
+          FAILURE_STAGE_FILE="$RUNNER_TEMP/adversarial-review-failure-stage.claim"
+          rm -f "$FAILURE_STAGE_FILE"
           # Written to a FILE, not a variable: the objection is assembled deep
           # inside the synthesis branch and the EXIT trap runs in a context that
           # cannot see a local. Empty until there is a real objection, which is
@@ -1390,11 +1450,15 @@ jobs:
             # never become an injection channel.
             local detail="${2:-}"
             [[ "$detail" =~ ^[A-Za-z0-9_=/.,\ -]{0,200}$ ]] || detail=""
-            # FIRST writer wins. The trap fires after the specific handler that
-            # already named the stage, and a specific stage is always more
-            # informative than the trap's fallback.
-            test "$FAILURE_STAGE_RECORDED" -eq 0 || return 0
-            FAILURE_STAGE_RECORDED=1
+            # FIRST writer wins, ACROSS SUBSHELLS. The trap fires after the
+            # specific handler that already named the stage, and a specific
+            # stage is always more informative than the trap's fallback -- but
+            # the specific handler is frequently the one running inside
+            # `$(call_models ...)`, so the claim has to outlive a subshell.
+            # `set -o noclobber` makes the create fail when the file exists, so
+            # the create IS the compare-and-set; it is scoped to a subshell so
+            # the option never leaks into the calling shell.
+            ( set -o noclobber; : > "$FAILURE_STAGE_FILE" ) 2>/dev/null || return 0
             test -n "${GITHUB_OUTPUT:-}" || return 0
             # NOT `test -f`. The success path appends to $GITHUB_OUTPUT without
             # requiring it to exist, and a diagnostic that is stricter than the
@@ -1470,7 +1534,7 @@ jobs:
             # step reports it as one.
             if ! state="$(curl --fail --silent --show-error --location \
               --proto '=https' --proto-redir '=https' --max-redirs 2 \
-              --max-time 15 --retry 2 \
+              --max-time 15 --retry 2 --retry-max-time 60 \
               https://raw.githubusercontent.com/jbutler1980/agent-ops-flags/main/state \
               | tr -d '[:space:]')"; then
               echo "Kill-switch state is unreadable; treating as engaged and not calling the model." >&2
@@ -1827,18 +1891,32 @@ jobs:
               # extra serialised width so that neither budget above moves; the
               # arithmetic is beside the evidence field in the schema.
               #
-              # The deletion below still runs and still matters. It is what
-              # lets a quote match across a backslash, and it keeps every
-              # citation that was admitted before this change admitted -- the
-              # quote-DELETED renderings the model produced while 34 was
-              # excluded still land in the same space as the verbatim ones it
-              # can produce now, because both sides delete.
+              # 34 IS NO LONGER DELETED, AND THAT IS AN ANTI-FABRICATION FIX.
+              #
+              # It used to be deleted from BOTH sides, as compensation for an
+              # alphabet that could not carry it. That compensation outlived
+              # its reason and became a hole: with the byte deleted on both
+              # sides, evidence `rm -rf "$dir/*"` grounded against a shown line
+              # reading `rm -rf $dir/*`. Those are different programs -- one
+              # glob-expands and one does not -- and the second was admitted as
+              # a VERBATIM citation of the first. Reproduced under real jq
+              # before it was changed, in both directions: the model could
+              # invent quoting the source does not have, and erase quoting it
+              # does. Nothing forces the compensation any more, because the
+              # alphabet admits the byte: the model can write the quote it
+              # sees. So the deletion set is now exactly {92}, the one byte a
+              # citation still cannot contain.
+              #
+              # This makes grounding STRICTER, never looser, and the cost is
+              # named: a citation that deletes a quote the source carries now
+              # fails and is regenerated. Measured against recorded fleet
+              # citations before shipping -- see the PR body.
               #
               # This step is DELETION, never substitution: it removes the
-              # double quote and the backslash and touches nothing else. (Those
-              # two are spelled out rather than shown, because a comment line
-              # ending in a lone backslash is a continuation to every scanner
-              # that reads this file as shell -- tests/test_no_comment_in_line_
+              # backslash and touches nothing else. (It is spelled out rather
+              # than shown, because a comment line ending in a lone backslash
+              # is a continuation to every scanner that reads this file as
+              # shell -- tests/test_no_comment_in_line_
               # continuation.py refuses one.) The ASCII fold defined below
               # is the only other normalisation, and between them there is
               # still no whitespace folding, no case folding and no reordering.
@@ -1858,7 +1936,7 @@ jobs:
               #     case and tests/pr-review-grounding.test.mjs re-asserts by
               #     extracting these very jq programs and running them under the
               #     real jq.
-              def strip_json_escapes: split("\"") | join("") | split("\\") | join("");
+              def strip_json_escapes: split("\\") | join("");
               # ASCII FOLD -- the same idea as the deletion above, forced by the
               # same constraint one level further out.
               #
@@ -1931,6 +2009,15 @@ jobs:
               #     still a single deterministic function of the shown bytes,
               #     so invented, re-worded, re-spaced and re-ordered quotes all
               #     still fail.
+              #   * The two curly double quotes are RENDERED to an ASCII
+              #     double quote rather than deleted. They were deleted while
+              #     the plain quote was deleted too; now that 34 is
+              #     significant on both sides, deleting them would make a
+              #     typographically-quoted source line uncitable through the
+              #     quote, while rendering them is exactly what the dash rows
+              #     already do -- write the ASCII the model actually produces.
+              #     It is a replacement with ASCII PUNCTUATION, so the property
+              #     above still holds.
               #   * KNOWN AND ACCEPTED COST: the nine dash-family codepoints
               #     become indistinguishable from a plain hyphen. That conflates
               #     dash SPELLING and nothing else -- dash RUN LENGTH is
@@ -1956,8 +2043,8 @@ jobs:
                 | split("\u2264") | join("<=")
                 | split("\u2019") | join("\u0027")
                 | split("\u2018") | join("\u0027")
-                | split("\u201c") | join("")
-                | split("\u201d") | join("")
+                | split("\u201c") | join("\"")
+                | split("\u201d") | join("\"")
                 | split("\u00a0") | join(" ")
                 | split("\u2010") | join("-")
                 | split("\u2011") | join("-")
@@ -1992,9 +2079,23 @@ jobs:
               #
               # THE FIX: the grounding set gains, per region, three LINE-JOIN
               # renderings, one per diff side. Each keeps the lines carrying
-              # that lead, DELETES the lead and the line break, and replaces
-              # every line of any OTHER side with a NUL. Deletion again -- the
-              # same move strip_json_escapes makes for the two characters the
+              # that lead, DELETES the lead and the line break -- INCLUDING the
+              # CR of a CRLF terminator -- and replaces every line of any OTHER
+              # side with a NUL.
+              #
+              # THE CR IS NOT OPTIONAL, and leaving it was a defect worth
+              # naming. `split("\n")` leaves the CR at the end of every line of
+              # a CRLF file, and the evidence alphabet is bytes 32-126, so a
+              # citation can never contain one. On a CRLF file the two rules
+              # were therefore jointly unsatisfiable again, for EVERY
+              # multi-line citation -- the exact shape this rendering exists to
+              # cure, reintroduced by one byte. Reproduced before it was fixed:
+              # `+alpha` CRLF `+beta` grounds nothing, the same content with LF
+              # grounds. Deleting it admits nothing new: it is part of the same
+              # line terminator as the `\n` already deleted, it is deleted only
+              # where the lead matched, and the NUL barrier between sides is
+              # untouched. Deletion again -- the
+              # same move strip_json_escapes makes for the one character the
               # schema tells the model to delete, extended to the one byte the
               # schema forbids it from writing. The schema description states
               # the same rule, so both sides land in one space by construction.
@@ -2022,7 +2123,7 @@ jobs:
               # NOTE: no apostrophes anywhere in this comment either.
               def side_join($lead):
                 split("\n")
-                | map(if startswith($lead) then .[1:] else "\u0000" end)
+                | map(if startswith($lead) then (.[1:] | rtrimstr("\r")) else "\u0000" end)
                 | join("");
               def grounds_joined($quote):
                 [side_join("+"), side_join("-"), side_join(" ")]
@@ -2212,15 +2313,19 @@ jobs:
                     # THE GROUND FORM MUST STILL CARRY A BYTE. Every string
                     # contains the empty string, so a quote that normalises
                     # away would ground against anything at all. That was
-                    # unreachable while the alphabet excluded 0x22, because
-                    # nothing else in a printable-ASCII evidence string can be
-                    # deleted; admitting 0x22 makes an all-quote excerpt
-                    # normalise to nothing, and the byte-exact ledger builder
-                    # already refuses one (`not evidence`). Without this line
-                    # the loop validator would be LOOSER than the ledger
-                    # builder and the run would detonate after every chunk had
-                    # already been admitted, which is the exact crash the
-                    # loop-level pre-check exists to prevent.
+                    # unreachable while the alphabet excluded 0x22 and became
+                    # reachable when 0x22 was admitted AND deleted. 0x22 is no
+                    # longer deleted, so for evidence that PASSES the alphabet
+                    # clause it is unreachable again -- and the clause stays
+                    # anyway, because it is cheap, because the byte-exact
+                    # ledger builder makes the same check (`not evidence`), and
+                    # because a validator that is looser than the ledger
+                    # builder detonates after every chunk has already been
+                    # admitted, which is the exact crash the loop-level
+                    # pre-check exists to prevent. The DIAGNOSTIC reporter runs
+                    # on responses that never passed the alphabet clause at
+                    # all, so there the case is live: see the note in
+                    # report_chunk_citations.
                     and (
                       (.evidence | ground_form) as $quote
                       | ($quote | utf8bytelength >= 1)
@@ -2337,7 +2442,7 @@ jobs:
               # Same deletion as validate_chunk_response, for the same reason.
               # The reporter must never contradict the authority, so the two
               # definitions are transcribed from each other.
-              def strip_json_escapes: split("\"") | join("") | split("\\") | join("");
+              def strip_json_escapes: split("\\") | join("");
               # Same fold as validate_chunk_response, transcribed from it for
               # the same reason as the deletion above: a reporter that folded
               # differently from the authority would name a clause on a
@@ -2350,8 +2455,8 @@ jobs:
                 | split("\u2264") | join("<=")
                 | split("\u2019") | join("\u0027")
                 | split("\u2018") | join("\u0027")
-                | split("\u201c") | join("")
-                | split("\u201d") | join("")
+                | split("\u201c") | join("\"")
+                | split("\u201d") | join("\"")
                 | split("\u00a0") | join(" ")
                 | split("\u2010") | join("-")
                 | split("\u2011") | join("-")
@@ -2366,12 +2471,15 @@ jobs:
               # Same LINE-JOIN renderings as the authority, transcribed from it
               # for the same reason as the deletion above: a reporter grounding
               # in fewer renderings than the validator would name this clause on
-              # a response the validator admitted. The full rationale, the
+              # a response the validator admitted. That includes the CRLF
+              # terminator handling -- a reporter that kept the CR would name
+              # the grounding clause on every multi-line citation in a CRLF
+              # file that the authority accepts. The full rationale, the
               # admitted set and every refusal it preserves are stated once, at
               # the head of validate_chunk_response.
               def side_join($lead):
                 split("\n")
-                | map(if startswith($lead) then .[1:] else "\u0000" end)
+                | map(if startswith($lead) then (.[1:] | rtrimstr("\r")) else "\u0000" end)
                 | join("");
               def grounds_joined($quote):
                 [side_join("+"), side_join("-"), side_join(" ")]
@@ -2527,7 +2635,7 @@ jobs:
             local response="$1" chunk_path="$2"
             local context_path="${3:?the shown-context regions file is required}"
             jq -r '
-              def strip_json_escapes: split("\"") | join("") | split("\\") | join("");
+              def strip_json_escapes: split("\\") | join("");
               # Same deletion and same fold as validate_chunk_response. A
               # diagnostic that folded differently from the authority would
               # print shown_in=none for a citation the authority accepted,
@@ -2540,8 +2648,8 @@ jobs:
                 | split("\u2264") | join("<=")
                 | split("\u2019") | join("\u0027")
                 | split("\u2018") | join("\u0027")
-                | split("\u201c") | join("")
-                | split("\u201d") | join("")
+                | split("\u201c") | join("\"")
+                | split("\u201d") | join("\"")
                 | split("\u00a0") | join(" ")
                 | split("\u2010") | join("-")
                 | split("\u2011") | join("-")
@@ -2564,11 +2672,27 @@ jobs:
               # every earlier assertion on `shown_in=<region>` still holds.
               def side_join($lead):
                 split("\n")
-                | map(if startswith($lead) then .[1:] else "\u0000" end)
+                | map(if startswith($lead) then (.[1:] | rtrimstr("\r")) else "\u0000" end)
                 | join("");
               def grounds_joined($quote):
                 [side_join("+"), side_join("-"), side_join(" ")]
                 | any(.[]; contains($quote));
+              # AN EMPTY GROUND FORM IS NOT "SHOWN EVERYWHERE".
+              #
+              # The hit test below used to skip on `$evidence == ""` -- the RAW
+              # field. A field that is non-empty but normalises to nothing got
+              # past it and reached `contains("")`, which is true of every
+              # string, so a citation the authority REJECTED was printed as
+              # `shown_in=file+hunk+overlap+chunk`: the strongest possible
+              # statement that the prompt and the grounding rule disagree,
+              # printed for a response where they do not. Reproduced on `"`
+              # and on a lone backslash before it was fixed.
+              #
+              # It is tested on the NORMALISED quote now. Note that fixing the
+              # double-quote deletion does NOT make this unreachable: this
+              # function runs on responses that were REJECTED, so its input
+              # never passed the alphabet clause, and 92 is still deleted --
+              # it must be, since a citation cannot carry one.
               (($context[0] + [$chunk]) | map(ground_form)) as $shown |
               ["file", "hunk", "overlap", "chunk"] as $names |
               ($shown | length) as $region_count |
@@ -2591,7 +2715,7 @@ jobs:
                 | ($evidence | ground_form) as $quote
                 | [
                     range(0; $region_count) as $i
-                    | if $evidence == "" then empty
+                    | if ($quote | utf8bytelength) == 0 then empty
                       elif ($shown[$i] | contains($quote)) then $names[$i]
                       elif ($shown[$i] | grounds_joined($quote))
                         then $names[$i] + "-joined"
@@ -3150,14 +3274,22 @@ jobs:
                                   + "line -- lines joined in one quote must all "
                                   + "carry the same leading character. When in "
                                   + "doubt quote ONE line. "
+                                  + "SEPARATE RULE, for the BACKSLASH: it cannot be "
+                                  + "emitted here either, so DELETE it and close up "
+                                  + "the gap -- do NOT substitute anything for it. "
+                                  + "Each region is checked with its backslashes "
+                                  + "deleted, so a deleted backslash matches and a "
+                                  + "substituted one never can. A line carrying a "
+                                  + "backslash is quotable: delete it rather than "
+                                  + "stopping the excerpt short. "
                                   + "SEPARATE RULE, for characters above byte 126 "
                                   + "only: those cannot be emitted here at all, so "
                                   + "RENDER them rather than delete them. An em dash "
                                   + "or en dash becomes a single hyphen, an ellipsis "
                                   + "becomes three dots, a rightwards arrow becomes "
                                   + "->, a typographic single quote becomes the ASCII "
-                                  + "apostrophe, and a TYPOGRAPHIC double quote is "
-                                  + "deleted (the plain ASCII one is not). Each region is "
+                                  + "apostrophe, and a TYPOGRAPHIC double quote "
+                                  + "becomes the plain ASCII double quote. Each region is "
                                   + "checked with exactly that rendering applied, so a "
                                   + "rendered quote matches -- render an em or en dash as "
                                   + "exactly ONE hyphen, never two, because runs of hyphens "
@@ -3550,8 +3682,8 @@ jobs:
               ("\u2264", "<="),
               ("\u2019", "\u0027"),
               ("\u2018", "\u0027"),
-              ("\u201c", ""),
-              ("\u201d", ""),
+              ("\u201c", "\""),
+              ("\u201d", "\""),
               ("\u00a0", " "),
               ("\u2010", "-"),
               ("\u2011", "-"),
@@ -3566,7 +3698,7 @@ jobs:
 
 
           def ground_form(region):
-              region = region.replace(b'"', b"").replace(b"\\", b"")
+              region = region.replace(b"\\", b"")
               for source, replacement in FOLD_TABLE:
                   region = region.replace(
                       source.encode("utf-8"), replacement.encode("ascii")
@@ -3631,8 +3763,15 @@ jobs:
               # reproduces the exact no-verdict crash the loop check exists to
               # prevent, one stage later and after every chunk has passed.
               def _side_join(region: bytes, lead: bytes) -> bytes:
+                  # `.removesuffix(b"\r")` is the CR of a CRLF terminator,
+                  # deleted with the LF it belongs to -- byte for byte what the
+                  # jq `rtrimstr("\r")` this is transcribed from does. Without
+                  # it a CRLF file could never ground a joined citation at all:
+                  # split leaves the CR, and the evidence alphabet is bytes
+                  # 32-126, so no admissible citation can carry one.
                   return b"".join(
-                      line[1:] if line.startswith(lead) else b"\x00"
+                      line[1:].removesuffix(b"\r")
+                      if line.startswith(lead) else b"\x00"
                       for line in region.split(b"\n")
                   )
 
@@ -5593,7 +5732,7 @@ jobs:
             # rather than reading as "switch is off".
             state="$(curl --fail --silent --show-error --location \
               --proto '=https' --proto-redir '=https' --max-redirs 2 \
-              --max-time 15 --retry 2 \
+              --max-time 15 --retry 2 --retry-max-time 60 \
               https://raw.githubusercontent.com/jbutler1980/agent-ops-flags/main/state \
               | tr -d '[:space:]')"
             test "$state" = "on"
