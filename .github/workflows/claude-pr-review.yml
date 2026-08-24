@@ -9,6 +9,27 @@
 
 name: Adversarial PR Review
 
+# `edited` IS IN THIS LIST, AND THE JOB GUARD BELOW IS WHY IT CAN BE.
+#
+# The spend problem is real: `edited` fires on a title or body change, and
+# NOTHING the model sees depends on either -- the reviewed representation is
+# built from the merge of the base and the pinned head and is bound by
+# `review_representation_sha256`. So an `edited` event re-ran a byte-identical
+# review, up to 49 sampled calls, replayable at will by anyone who can edit the
+# title, since `cancel-in-progress` bounds CONCURRENCY, not SPEND.
+#
+# BUT `edited` ALSO FIRES WHEN THE BASE BRANCH CHANGES, and that is the one
+# event no other activity type covers. Change the base without pushing to the
+# head and nothing here starts, so the previous green check stays attached to
+# the same head SHA while describing a review against a DIFFERENT merge base --
+# a protected branch could accept a pull request this reviewer never evaluated
+# against it. Dropping the trigger to stop the spend removed the only
+# base-change signal with it.
+#
+# So the trigger stays and the JOB is guarded instead: an `edited` event runs
+# ONLY when the payload carries `changes.base`, which GitHub sets on exactly
+# that edit. A title or body edit skips before a runner is allocated, so it
+# costs nothing and cannot be replayed; a base change is reviewed.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
@@ -22,6 +43,13 @@ concurrency:
 jobs:
   claude-review:
     name: claude-review
+    # THE `edited` GUARD. See the note on the trigger list above: `edited` is
+    # kept for the base-branch change it is the only signal for, and skipped for
+    # the title/body edits that would re-run a byte-identical review. Evaluated
+    # before a runner is allocated, so a skipped edit spends nothing.
+    if: >-
+      github.event.action != 'edited'
+      || github.event.changes.base != null
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
@@ -52,10 +80,26 @@ jobs:
       MODEL: ${{ github.event.pull_request.user.login == 'dependabot[bot]' && 'gpt-5-mini' || 'gpt-5.4' }}
       RESPONSE_MODEL: ${{ github.event.pull_request.user.login == 'dependabot[bot]' && 'gpt-5-mini-2025-08-07' || 'gpt-5.4-2026-03-05' }}
     steps:
+      # REDIRECTS ARE HTTPS-ONLY AND BOUNDED, AT EVERY KILL-SWITCH FETCH.
+      #
+      # `--location` on its own follows up to 50 hops into ANY protocol curl was
+      # built with. The flag is still wanted -- raw.githubusercontent.com does
+      # redirect -- but an unrestricted follow means a redirect or a DNS/MITM
+      # position can serve `on` from a plaintext hop while the operator has set
+      # the flag to `off`, and the kill switch is exactly the control that must
+      # not be defeatable by the network.
+      #
+      # `--proto '=https'` restricts the FIRST request, `--proto-redir '=https'`
+      # restricts every subsequent hop, and `--max-redirs 2` bounds the chain.
+      # All three failure modes exit curl non-zero, and because the value is
+      # captured in an assignment under `set -euo pipefail` a non-zero curl
+      # aborts the step. An unreadable switch is therefore treated as ENGAGED,
+      # never as "off, proceed" -- the direction a kill switch has to fail.
       - name: Enforce global kill switch
         run: |
           set -euo pipefail
           state="$(curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --max-redirs 2 \
             --max-time 15 --retry 2 \
             https://raw.githubusercontent.com/jbutler1980/agent-ops-flags/main/state \
             | tr -d '[:space:]')"
@@ -98,7 +142,72 @@ jobs:
           # and byte sizes. Strings the pull request controls (labels, head
           # repository, title, diff content) are reported as clause NAMES and
           # never echoed, so no untrusted text can reach the job log.
+          # THE SOURCE PHASE NOW NAMES ITS FAILURES TOO.
+          #
+          # Measured on this repository's own history: of 18 failed reviewer
+          # runs, 14 died in THIS step, before chunking and before any model
+          # call. Every one of them reached the enforcement step as
+          # `stage=unreported` and was printed as "the review step failed at an
+          # unclassified point" -- a sentence that names the MODEL step, which
+          # had been skipped. The operator was pointed at the wrong step, for
+          # the dominant failure class, for the entire life of the gate.
+          #
+          # The recorder writes to THIS step's own $GITHUB_OUTPUT. It is a
+          # separate channel from the model step's `record_failure_stage`, and
+          # deliberately so: when this step dies the model step never runs, so
+          # its outputs do not exist and cannot carry anything.
+          #
+          # DIAGNOSTIC ONLY. These stages are all prefixed `source-`, the
+          # enforcement step admits them only through that prefix, and no
+          # `source-` stage is publishable -- publication still requires
+          # `merit` or `injection` together with a structured `fail`, neither of
+          # which this step can produce. Nothing here relaxes a bound: every
+          # rejection below still exits non-zero exactly as it did before.
+          SOURCE_FAILURE_STAGE_RECORDED=0
+          record_source_failure_stage() {
+            local stage="$1"
+            # Same closed alphabet as the model step's detail channel, and
+            # assembled from the same kind of value: refs, 40-hex object names,
+            # counts and byte sizes computed by the runner. Strings the pull
+            # request controls never reach it. Anything outside the alphabet is
+            # dropped rather than printed, because a diagnostic must never
+            # become an injection channel.
+            local detail="${2:-}"
+            [[ "$detail" =~ ^[A-Za-z0-9_=/.,\ -]{0,200}$ ]] || detail=""
+            # FIRST writer wins, exactly as in the model step: the EXIT trap
+            # fires after the specific handler that already named the stage.
+            test "$SOURCE_FAILURE_STAGE_RECORDED" -eq 0 || return 0
+            SOURCE_FAILURE_STAGE_RECORDED=1
+            test -n "${GITHUB_OUTPUT:-}" || return 0
+            test ! -L "$GITHUB_OUTPUT" || return 0
+            {
+              printf 'failure-stage=%s\n' "$stage"
+              printf 'failure-detail=%s\n' "$detail"
+            } >> "$GITHUB_OUTPUT" 2>/dev/null || return 0
+          }
+
+          # Catch-all, and the reason "fails without saying why" is unreachable
+          # in this step as well: a `set -e` death anywhere -- a gh api that
+          # vanished, a jq that could not parse, an assertion nobody
+          # instrumented -- still tells the enforcement step WHICH step died.
+          # `source-unclassified` is not a diagnosis; it is an honest admission
+          # that names the phase, which is strictly more than the blank the
+          # operator gets today.
+          on_source_exit() {
+            local status="$?"
+            test "$status" -ne 0 || return 0
+            record_source_failure_stage "source-unclassified" \
+              "exit_status=${status}"
+          }
+          trap on_source_exit EXIT
+
+          # Optional $2 = stage, optional $3 = detail. The default keeps every
+          # existing call site byte-identical in behaviour and still classified:
+          # an untagged assertion reports `source-assertion`, which already
+          # names the phase. $1 is unchanged and is still the only thing
+          # printed, so no call site's log line moves.
           fail_source_assertion() {
+            record_source_failure_stage "${2:-source-assertion}" "${3:-}"
             printf 'Adversarial review failed source assertion: %s\n' "$1" >&2
             exit 1
           }
@@ -259,10 +368,19 @@ jobs:
             if [ "$disposition" != "review-failed" ]; then
               printf '::notice title=Not reviewable (%s)::%s\n' "$disposition" \
                 "live pull request rejected [${clauses}]: pr=${PR_NUMBER}. This is the reviewer declining to review, not a finding against the pull request. The check is red because a GitHub Actions job cannot conclude neutral; treat review-disposition, not the colour, as the result." >&2
+              # The disposition is one of a closed set this function computes
+              # itself; the CLAUSES are derived from pull-request-controlled
+              # fields and are deliberately NOT carried here. Declining to
+              # review is the one red that means nothing is wrong, and it is
+              # worth telling apart from a reviewer that broke.
+              record_source_failure_stage "source-not-reviewable" \
+                "pr=${PR_NUMBER} disposition=${disposition}"
               exit 1
             fi
             fail_source_assertion \
-              "live pull request rejected [${clauses}]: pr=${PR_NUMBER} base_ref=${EXPECTED_BASE_REF} base_sha=${EXPECTED_BASE_SHA} head_sha=${EXPECTED_HEAD_SHA} pull_request_bytes=${pr_bytes}"
+              "live pull request rejected [${clauses}]: pr=${PR_NUMBER} base_ref=${EXPECTED_BASE_REF} base_sha=${EXPECTED_BASE_SHA} head_sha=${EXPECTED_HEAD_SHA} pull_request_bytes=${pr_bytes}" \
+              "source-pull-request-rejected" \
+              "pr=${PR_NUMBER} pull_request_bytes=${pr_bytes}"
           }
 
           # The live pull request object is NOT asked for its base.sha. GitHub
@@ -295,7 +413,9 @@ jobs:
             and .object.sha == $base
           ' "$protected_ref" >/dev/null \
             || fail_source_assertion \
-              "stale_event: the default branch moved after this run was dispatched [$(report_failed_protected_ref_clauses "$protected_ref")]: base_ref=${EXPECTED_BASE_REF} expected_base_sha=${EXPECTED_BASE_SHA} observed_base_sha=$(observed_protected_base_sha "$protected_ref") event_base_sha=${EVENT_BASE_SHA} pr=${PR_NUMBER}"
+              "stale_event: the default branch moved after this run was dispatched [$(report_failed_protected_ref_clauses "$protected_ref")]: base_ref=${EXPECTED_BASE_REF} expected_base_sha=${EXPECTED_BASE_SHA} observed_base_sha=$(observed_protected_base_sha "$protected_ref") event_base_sha=${EVENT_BASE_SHA} pr=${PR_NUMBER}" \
+              "source-stale-event" \
+              "pr=${PR_NUMBER} expected_base_sha=${EXPECTED_BASE_SHA}"
 
           git_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           export GIT_CONFIG_COUNT=1
@@ -457,8 +577,15 @@ jobs:
           # and a conflicted merge can never be reported as a clean one.
           if test "$merge_status" -eq 1 \
             && [[ "$merge_tree" =~ ^[0-9a-f]{40}$ ]]; then
+            # 13 of this repository's 14 source-phase deaths were exactly this,
+            # every one of them on the same pull request against a base that had
+            # moved on without it. It is not a defect in the reviewer and it is
+            # not a finding about the change: it is an instruction to rebase,
+            # and it deserves to arrive at the enforcement step as one.
             fail_source_assertion \
-              "conflicted merge: the head does not merge cleanly into the reviewed base, so there is no single tree to review (git merge-tree exit 1). Merge or rebase the base branch into the pull request branch and push. base_sha=${EXPECTED_BASE_SHA} head_sha=${EXPECTED_HEAD_SHA} base_ref=${EXPECTED_BASE_REF} pr=${PR_NUMBER}"
+              "conflicted merge: the head does not merge cleanly into the reviewed base, so there is no single tree to review (git merge-tree exit 1). Merge or rebase the base branch into the pull request branch and push. base_sha=${EXPECTED_BASE_SHA} head_sha=${EXPECTED_HEAD_SHA} base_ref=${EXPECTED_BASE_REF} pr=${PR_NUMBER}" \
+              "source-conflicted-merge" \
+              "pr=${PR_NUMBER} base_sha=${EXPECTED_BASE_SHA} head_sha=${EXPECTED_HEAD_SHA}"
           fi
           test "$merge_status" -eq 0 \
             || fail_source_assertion \
@@ -510,6 +637,11 @@ jobs:
             if ! GIT_NO_LAZY_FETCH=1 git -C "$repository" cat-file -e "$oid" \
               2>/dev/null; then
               echo "A changed blob is outside the 1 MiB acquisition boundary; use an independent review path." >&2
+              # One of the reviewer's OWN bounds, and the one that means "this
+              # change is too big for this reviewer", not "this reviewer is
+              # broken". The oid is a runner-computed 40-hex object name.
+              record_source_failure_stage "source-acquisition-bound" \
+                "pr=${PR_NUMBER} blob_oid=${oid} limit=1048576"
               exit 1
             fi
             test "$(GIT_NO_LAZY_FETCH=1 git -C "$repository" cat-file -t "$oid")" \
@@ -631,6 +763,45 @@ jobs:
           REPOSITORY_DIR: ${{ steps.source.outputs.repository-dir }}
         run: |
           set -euo pipefail
+          # THE CHUNK-BUILDING PHASE NAMES ITS FAILURES, ON THE SAME TERMS AS
+          # THE SOURCE PHASE ABOVE AND THE MODEL PHASE BELOW.
+          #
+          # This step has no instrumented exits at all: the whole of it is one
+          # `set -e` region around a Python transformer, so any death here --
+          # a transformer traceback, a representation that overflows its own
+          # ceiling, a manifest that fails its shape check -- reaches the
+          # enforcement step as nothing, and is printed as "the review step
+          # failed at an unclassified point". No run in this repository's
+          # history has died here yet, which is exactly why it is worth
+          # instrumenting BEFORE one does rather than after.
+          #
+          # DIAGNOSTIC ONLY, and prefixed `chunks-` for the same reason the
+          # source phase is prefixed `source-`: the enforcement step admits
+          # these stages only through that prefix, and no `chunks-` stage is
+          # publishable. No bound is relaxed and no exit becomes softer; the
+          # step still dies on the same conditions, at the same places.
+          CHUNKS_FAILURE_STAGE_RECORDED=0
+          record_chunks_failure_stage() {
+            local stage="$1"
+            local detail="${2:-}"
+            [[ "$detail" =~ ^[A-Za-z0-9_=/.,\ -]{0,200}$ ]] || detail=""
+            test "$CHUNKS_FAILURE_STAGE_RECORDED" -eq 0 || return 0
+            CHUNKS_FAILURE_STAGE_RECORDED=1
+            test -n "${GITHUB_OUTPUT:-}" || return 0
+            test ! -L "$GITHUB_OUTPUT" || return 0
+            {
+              printf 'failure-stage=%s\n' "$stage"
+              printf 'failure-detail=%s\n' "$detail"
+            } >> "$GITHUB_OUTPUT" 2>/dev/null || return 0
+          }
+          on_chunks_exit() {
+            local status="$?"
+            test "$status" -ne 0 || return 0
+            record_chunks_failure_stage "chunks-unclassified" \
+              "exit_status=${status}"
+          }
+          trap on_chunks_exit EXIT
+
           chunk_dir="$RUNNER_TEMP/pr-review-chunks"
           manifest="$RUNNER_TEMP/pr-review-manifest.json"
           test ! -e "$chunk_dir"
@@ -1020,7 +1191,16 @@ jobs:
             )
             and ($review.chunk_count >= 1 and $review.chunk_count <= 48)
             and ($review.chunks | length == $review.chunk_count)
-          ' "$manifest" >/dev/null
+          ' "$manifest" >/dev/null \
+            || {
+              # The `jq -e` conjunction above remains the single authority on
+              # admission; this only names the phase that rejected. The counts
+              # are read back with a non-authoritative `jq` whose failure
+              # yields an empty detail, never an aborted diagnostic.
+              record_chunks_failure_stage "chunks-manifest" \
+                "chunk_count=$(jq -r '.chunk_count // "none"' "$manifest" 2>/dev/null || printf 'unreadable') limit=48"
+              exit 1
+            }
           {
             echo "chunk-dir=$chunk_dir"
             echo "manifest-file=$manifest"
@@ -1196,6 +1376,20 @@ jobs:
 
           record_failure_stage() {
             local stage="$1"
+            # Optional second argument: a SHORT machine-generated detail that
+            # travels with the stage to the enforcement step, so the operator
+            # reads the reason on the step that reports the outcome instead of
+            # having to expand an earlier step and scroll. It is DIAGNOSTIC
+            # ONLY and carries no more authority than the stage name.
+            #
+            # It is assembled EXCLUSIVELY from runner-computed values -- loop
+            # counters and curl's own %{http_code} -- never from API or model
+            # text, so no untrusted string can reach the log through it. The
+            # alphabet is closed and re-checked here anyway; anything outside
+            # it is dropped rather than printed, because a diagnostic must
+            # never become an injection channel.
+            local detail="${2:-}"
+            [[ "$detail" =~ ^[A-Za-z0-9_=/.,\ -]{0,200}$ ]] || detail=""
             # FIRST writer wins. The trap fires after the specific handler that
             # already named the stage, and a specific stage is always more
             # informative than the trap's fallback.
@@ -1210,6 +1404,7 @@ jobs:
             test ! -L "$GITHUB_OUTPUT" || return 0
             {
               printf 'failure-stage=%s\n' "$stage"
+              printf 'failure-detail=%s\n' "$detail"
               printf 'model=%s\n' "$MODEL"
               # The objection is base64 of a byte-bounded, printable-ASCII
               # transcript, so it can never inject a newline into $GITHUB_OUTPUT
@@ -1238,12 +1433,67 @@ jobs:
           }
           trap on_review_exit EXIT
 
+          # THE KILL SWITCH IS RE-READ BEFORE EVERY OUTBOUND REQUEST.
+          #
+          # It used to be read exactly once, as step 1 of the job. Between that
+          # read and the first token of spend sit the fetch, the local merge and
+          # the chunk build; after it sit up to 49 sampled `gpt-5.4` calls, each
+          # retried up to five times. Flipping the flag to `off` stopped no run
+          # that had already started -- the one step that spends the third-party
+          # key re-checked ZERO times, while the publisher, which spends
+          # nothing, re-checked three. The control was pointed at the wrong half
+          # of the job.
+          #
+          # The check lives INSIDE the retry loop, not at the top of the
+          # function, because a retry is a fresh outbound request and a bound of
+          # "once per logical call" would still let a cancelled run spend four
+          # more. One check, strictly ordered, per request over the wire.
+          #
+          # Fail-closed in BOTH directions: an unreadable switch (any curl
+          # failure, including a refused plaintext hop or an over-long redirect
+          # chain) and a switch reading anything other than `on` both return
+          # non-zero, and `call_models` aborts WITHOUT issuing the request.
+          #
+          # There is deliberately NO check counter here. A tally this function
+          # increments itself would be the function's own account of its own
+          # behaviour, and the suite that proves this property counts the
+          # requests that actually reached the wire instead.
+          assert_kill_switch_on() {
+            local state
+            # THE STAGE IS RECORDED HERE, NOT BY THE CALLER. Returning non-zero
+            # makes call_models fail, and its callers record `chunk-transport` or
+            # `synthesis-transport` -- which sends an operator to investigate the
+            # model endpoint for a control that worked exactly as intended.
+            # record_failure_stage is FIRST-writer-wins, so naming it here means
+            # the caller''s later, wronger stage is a no-op. `kill-switch` is a
+            # cancellation, never a finding about the change, and the enforcement
+            # step reports it as one.
+            if ! state="$(curl --fail --silent --show-error --location \
+              --proto '=https' --proto-redir '=https' --max-redirs 2 \
+              --max-time 15 --retry 2 \
+              https://raw.githubusercontent.com/jbutler1980/agent-ops-flags/main/state \
+              | tr -d '[:space:]')"; then
+              echo "Kill-switch state is unreadable; treating as engaged and not calling the model." >&2
+              record_failure_stage "kill-switch" "state=unreadable"
+              return 1
+            fi
+            if [ "$state" != "on" ]; then
+              echo "Kill switch is not 'on'; not calling the model." >&2
+              record_failure_stage "kill-switch" "state=off"
+              return 1
+            fi
+            return 0
+          }
+
           call_models() {
             local request="$1"
             local response="$2"
             local headers="${response}.headers"
             local attempt status retry_after delay
             for attempt in 1 2 3 4 5; do
+              # STRICTLY BEFORE the request on the next line. Nothing may be
+              # inserted between these two statements.
+              assert_kill_switch_on || return 1
               if ! status="$(curl --silent --show-error \
                 --max-time 600 \
                 https://api.openai.com/v1/chat/completions \
@@ -1562,35 +1812,222 @@ jobs:
             jq -e '
               # GROUNDING NORMALISATION -- deletion only, applied to BOTH sides.
               #
-              # The evidence alphabet forbids 34 (") and 92 (\) so that a field
-              # is the same length raw and JSON-serialised, which is what keeps
-              # the canonical response inside 1024 bytes and the ledger inside
-              # 10400. That is load-bearing and stays. But it collides with the
-              # grounding clause below, which demands an EXACT substring of the
-              # chunk: 23.1% of citable diff lines carry one of those two bytes,
-              # so on those lines constrained decoding made the required answer
+              # The evidence alphabet forbids 92 (\) so that a field is the same
+              # length raw and JSON-serialised, which is what keeps the
+              # canonical response inside 1024 bytes and the ledger inside
+              # 10400. That is load-bearing and stays. It ALSO forbade 34 (")
+              # for the same reason, and that collided with the grounding
+              # clause below, which demands an EXACT substring of the chunk:
+              # 23.1% of citable diff lines carry one of those two bytes, so on
+              # those lines constrained decoding made the required answer
               # unrepresentable and every one of the four structured attempts
-              # was spent on a quote that could not possibly match.
+              # was spent on a quote that could not possibly match. Run
+              # 31812396266 died exactly there, on a quoted shell test. 34 is
+              # admitted now, and the length cap on the field pays for the
+              # extra serialised width so that neither budget above moves; the
+              # arithmetic is beside the evidence field in the schema.
               #
-              # The cure is to compare in a space both sides can reach: delete
-              # exactly those two bytes from the chunk as well. The schema tells
-              # the model to DELETE them rather than substitute, so its output
-              # lands in the same space by construction.
+              # The deletion below still runs and still matters. It is what
+              # lets a quote match across a backslash, and it keeps every
+              # citation that was admitted before this change admitted -- the
+              # quote-DELETED renderings the model produced while 34 was
+              # excluded still land in the same space as the verbatim ones it
+              # can produce now, because both sides delete.
               #
-              # This is DELETION, never substitution or normalisation of
-              # anything else -- no whitespace folding, no case folding, no
-              # reordering. Two consequences worth stating:
-              #   * It can only ADD acceptances. An evidence string that is a
-              #     substring of the raw chunk contains no " or \ (the alphabet
-              #     clause already rejected those), so deleting " and \ from the
-              #     chunk cannot break its contiguity. Every quote admitted
-              #     before this change is still admitted.
+              # This step is DELETION, never substitution: it removes the
+              # double quote and the backslash and touches nothing else. (Those
+              # two are spelled out rather than shown, because a comment line
+              # ending in a lone backslash is a continuation to every scanner
+              # that reads this file as shell -- tests/test_no_comment_in_line_
+              # continuation.py refuses one.) The ASCII fold defined below
+              # is the only other normalisation, and between them there is
+              # still no whitespace folding, no case folding and no reordering.
+              # Two consequences worth stating:
+              #   * It can only ADD acceptances. Deleting a fixed set of
+              #     characters is a homomorphism, so it commutes with the
+              #     substring relation: if a quote was a substring of a region
+              #     before the deletion it is a substring of the deleted region
+              #     after it, whether or not the quote itself carried one of
+              #     the deleted bytes. Every quote admitted before this change
+              #     is still admitted.
               #   * It cannot admit a paraphrase. The comparison target is still
               #     a single deterministic function of the chunk bytes, so
               #     invented, re-worded, whitespace-normalised and re-ordered
-              #     quotes all still fail, as tests/test_canonical_pr_review_
-              #     hardening.py asserts case by case.
+              #     quotes all still fail, as
+              #     tests/test_canonical_pr_review_hardening.py asserts case by
+              #     case and tests/pr-review-grounding.test.mjs re-asserts by
+              #     extracting these very jq programs and running them under the
+              #     real jq.
               def strip_json_escapes: split("\"") | join("") | split("\\") | join("");
+              # ASCII FOLD -- the same idea as the deletion above, forced by the
+              # same constraint one level further out.
+              #
+              # The evidence field is a `strict` Structured Outputs pattern, so
+              # constrained decoding physically cannot emit a byte above 0x7E.
+              # A source line carrying one was therefore UNCITABLE: the model
+              # had to substitute, the grounding corpus kept the original
+              # bytes, and no rendering of that line could ever be an exact
+              # substring. Both rules were satisfiable alone and neither could
+              # be satisfied together. Measured on run 31668217530: all four
+              # structured attempts on one chunk failed THIS clause and the run
+              # recorded stage=unclassified with no verdict at all. 4618 of
+              # 103720 tracked non-blank lines, 4.45%, carry such a byte.
+              #
+              # DELETING the byte from the corpus does NOT work, and that is
+              # the trap worth naming: the model SUBSTITUTES rather than
+              # deletes. Delete an em dash from a source line and the two
+              # letters around it close up, while the model writes a hyphen
+              # between them, so the clause still fails. Each
+              # non-ASCII codepoint is therefore RENDERED into the ASCII the
+              # model actually produces. Only the codepoints named in the table
+              # below are rendered.
+              #
+              # THERE IS NO DASH-RUN COLLAPSE, AND ITS ABSENCE IS A CORRECTION.
+              #
+              # The fold this was ported from also collapsed every run of two or
+              # more hyphens to one, on BOTH sides, because the logged attempts
+              # wrote one em dash as `-` in some responses and `--` in others.
+              # That collapse ADMITS FABRICATED TEXT, and was measured doing it:
+              # a chunk containing `curl ` followed by two hyphens and `fail`
+              # folds to a SINGLE hyphen, so an evidence string carrying one
+              # hyphen there -- a flag that appears nowhere in the source, and a
+              # different flag -- grounds. On a fleet of shell-heavy
+              # repositories those runs are everywhere, so this is not a corner
+              # case; and it contradicts this fold OWN stated property below,
+              # that it cannot admit a paraphrase.
+              #
+              # The cost of removing it is bounded and known: an em dash the
+              # model renders as TWO hyphens no longer grounds. The schema
+              # description asks for exactly one, the model has four structured
+              # attempts, and a citation that costs a regeneration is strictly
+              # better than a grounding rule that admits text nobody wrote.
+              #
+              # THE TABLE IS A CLOSED LIST, NOT A CATCH-ALL, and that is the
+              # whole security argument. An earlier draft folded EVERY
+              # codepoint above 126 to a dash. The reviewer objected on
+              # 2026-08-13 (PR 162, run 31675891148 attempt 2) that this let
+              # fabricated ASCII evidence match distinct shown text: source
+              # `a<check mark>b` folded to `a-b`, so a model that never saw a
+              # dash could cite one. The objection was correct and the
+              # catch-all is gone. A codepoint not named above is left ALONE,
+              # which leaves its line exactly as citable as it was before this
+              # change -- quotable around the character, never through it.
+              # Measured: the named set covers 4206 of the 4618 affected lines,
+              # 91.1%, and the remaining 8.9% keep their old behaviour rather
+              # than gaining a false one.
+              #
+              # SAFETY PROPERTIES, each one asserted in
+              # tests/pr-review-grounding.test.mjs:
+              #   * Every replacement is ASCII PUNCTUATION or space. No
+              #     codepoint is ever folded to an ASCII LETTER or DIGIT, so a
+              #     homoglyph can never become citable as the plain word it
+              #     imitates: Cyrillic o is not in the table, so it survives
+              #     the fold and `Bail Bonds` cannot ground against it. That
+              #     keeps this fold from undoing the homoglyph guard.
+              #   * It can only ADD acceptances. Both sides run through one
+              #     function and substring containment survives it, so every
+              #     quote admitted before this change is still admitted.
+              #   * It cannot admit a paraphrase. The comparison target is
+              #     still a single deterministic function of the shown bytes,
+              #     so invented, re-worded, re-spaced and re-ordered quotes all
+              #     still fail.
+              #   * KNOWN AND ACCEPTED COST: the nine dash-family codepoints
+              #     become indistinguishable from a plain hyphen. That conflates
+              #     dash SPELLING and nothing else -- dash RUN LENGTH is
+              #     preserved, so a doubled hyphen stays distinct from a single
+              #     one and the unified-diff markers survive intact. It invents
+              #     no text and moves no text between regions.
+              #   * NOT FIXED, deliberately: a quote spanning a line break
+              #     still cannot ground. Reconciling one would mean stripping
+              #     the +/-/space diff prefix off continuation lines, which
+              #     erases the added-versus-removed distinction the review
+              #     exists to make. 2 of the 12 ungrounded citations logged in
+              #     run 31668217530 were of that shape and stay rejected.
+              #
+              # NOTE: no apostrophes and no byte above 0x7E anywhere in this
+              # program. It sits inside a single-quoted jq program, where an
+              # apostrophe would hand the rest of the program to the shell, and
+              # a high byte would make these very lines uncitable to the
+              # reviewer that reads this file.
+              def ascii_fold:
+                split("\u2026") | join("...")
+                | split("\u2192") | join("->")
+                | split("\u2265") | join(">=")
+                | split("\u2264") | join("<=")
+                | split("\u2019") | join("\u0027")
+                | split("\u2018") | join("\u0027")
+                | split("\u201c") | join("")
+                | split("\u201d") | join("")
+                | split("\u00a0") | join(" ")
+                | split("\u2010") | join("-")
+                | split("\u2011") | join("-")
+                | split("\u2012") | join("-")
+                | split("\u2013") | join("-")
+                | split("\u2014") | join("-")
+                | split("\u2015") | join("-")
+                | split("\u2212") | join("-")
+                | split("\u2500") | join("-")
+                | split("\u2501") | join("-");
+              def ground_form: strip_json_escapes | ascii_fold;
+              # A CITATION MAY NEED TO CROSS A LINE BREAK, AND THE MODEL CANNOT
+              # WRITE ONE. That is the whole defect, and it is structural.
+              #
+              # The evidence pattern admits bytes 32-126 only, so a newline is
+              # UNREPRESENTABLE in a citation, while every region below is
+              # multi-line diff text. For any construct spanning a line the two
+              # rules were jointly unsatisfiable: the model joined the lines,
+              # deleted the newline and the diff lead, and its own grounding
+              # clause then correctly refused the result. Nothing told it the
+              # constraint, so it never varied: four attempts, four identical
+              # failures, CLAUDE_FAILURE_STAGE unclassified, STRUCTURED_VERDICT
+              # empty -- an unmergeable pull request with no diagnosis at all.
+              #
+              # Recorded THREE times across TWO lanes (p4 F1c section 7, F4b
+              # section 8d): a YAML block sequence under operations:, a YAML
+              # expr: block scalar, and a second rule after the first was fixed.
+              # Each was cured only by rewriting the SOURCE -- flow style, then
+              # a 365-character single-line PromQL expression. Changing source
+              # to satisfy a reviewer bug trades human readability for machine
+              # reviewability, which is a bad trade and must not outlive this.
+              #
+              # THE FIX: the grounding set gains, per region, three LINE-JOIN
+              # renderings, one per diff side. Each keeps the lines carrying
+              # that lead, DELETES the lead and the line break, and replaces
+              # every line of any OTHER side with a NUL. Deletion again -- the
+              # same move strip_json_escapes makes for the two characters the
+              # schema tells the model to delete, extended to the one byte the
+              # schema forbids it from writing. The schema description states
+              # the same rule, so both sides land in one space by construction.
+              #
+              # WHAT THIS ADMITS, exactly: a run of CONSECUTIVE lines from ONE
+              # region that are ALL ON THE SAME SIDE of the diff, with the line
+              # breaks and leads removed. Every byte was displayed, in order,
+              # from one side of one region. Nothing is normalised or moved.
+              #
+              # WHAT IT STILL REFUSES, each with its mechanism:
+              #   * a quote crossing SIDES -- a removed line joined to an added
+              #     one, which would cite deleted code as if it survived. The
+              #     NUL barrier sits between them, and the alphabet clause
+              #     bounds evidence to bytes 32-126, so no admissible citation
+              #     can contain a NUL. This is the load-bearing bound.
+              #   * a quote crossing NON-CONSECUTIVE lines -- same barrier.
+              #   * a quote crossing REGIONS -- containment is still PER REGION.
+              #   * paraphrase, whitespace normalisation, re-spacing, character
+              #     substitution, re-ordering -- nothing is normalised, so all
+              #     of these fail exactly as they did before.
+              # tests/test_reviewer_multiline_citation_grounding.py asserts each
+              # of those refusals against the same fixture that proves the
+              # widening, so a widening that degenerated into accept-anything
+              # fails there rather than in production.
+              # NOTE: no apostrophes anywhere in this comment either.
+              def side_join($lead):
+                split("\n")
+                | map(if startswith($lead) then .[1:] else "\u0000" end)
+                | join("");
+              def grounds_joined($quote):
+                [side_join("+"), side_join("-"), side_join(" ")]
+                | any(.[]; contains($quote));
+              def grounds($quote): contains($quote) or grounds_joined($quote);
               # THE GROUNDING SET IS EVERY REGION THE PROMPT SHOWS, IN PROMPT
               # ORDER -- file header, hunk header, overlap, then the chunk.
               #
@@ -1629,10 +2066,10 @@ jobs:
               #   * assert_chunk_request_binding compares the WHOLE user message
               #     against a recomposition from this same file, so "shown" and
               #     "grounded" cannot drift apart again without failing closed.
-              # tests/test_canonical_pr_review_hardening.py asserts case by case
-              # that invented, paraphrased, re-spaced, re-ordered and
+              # tests/pr-review-grounding.test.mjs asserts case by
+              # case that invented, paraphrased, re-spaced, re-ordered and
               # foreign-chunk quotes are all still refused.
-              (($context[0] + [$chunk]) | map(strip_json_escapes)) as $grounding
+              (($context[0] + [$chunk]) | map(ground_form)) as $grounding
               | .model == $response_model
               and (.choices | length == 1)
               and .choices[0].finish_reason == "stop"
@@ -1721,7 +2158,26 @@ jobs:
                       | type == "string"
                       and utf8bytelength >= 1
                       and utf8bytelength <= 96
-                      and (explode | all((. >= 32 and . <= 126) and . != 34 and . != 92))
+                      and (explode | all((. >= 32 and . <= 126) and . != 92))
+                      # THE BUDGET IS MEASURED ON THE SERIALISED FIELD, so the
+                      # cap is too. A double-quote is one byte here and TWO
+                      # inside the canonical response and the ledger, and both
+                      # of those are bounded (1024 and 10400) against a worst
+                      # case computed when this field could not carry one.
+                      # tojson is the exact width the field occupies there:
+                      # two delimiters plus one byte per character plus one
+                      # more per double-quote. Holding that at 98 holds the
+                      # payload at 96, which is precisely what a quote-free
+                      # 96-byte excerpt cost before double-quotes were
+                      # admitted, so NEITHER budget moves. The cap is
+                      # graduated rather than flat: quote-free text still gets
+                      # all 96 characters, and only a quote-DENSE excerpt is
+                      # shortened. Flattening it to 48 instead would keep the
+                      # same worst case and cost every citation half its
+                      # length -- measured, it makes the 60-byte line that
+                      # tests/pr-review-grounding.test.mjs replays
+                      # from run 31668217530 uncitable again.
+                      and (tojson | utf8bytelength <= 98)
                     )
                     # EVIDENCE GROUNDING -- the anti-fabrication property, now
                     # checked HERE, where a violation is still RETRYABLE.
@@ -1743,13 +2199,32 @@ jobs:
                     # still refuses to emit a ledger if it ever fails. So this
                     # clause can only reject earlier -- it can never admit a
                     # fabricated quote the byte-exact check would have caught.
-                    # Both sides run through strip_json_escapes (see the head of
-                    # this program); the ledger builder applies the identical
-                    # deletion to the raw bytes AND to the identical region
-                    # list, so the two never disagree.
+                    # Both sides run through ground_form (see the head of this
+                    # program); the ledger builder applies the identical
+                    # deletion AND the identical ASCII fold to the raw bytes
+                    # AND to the identical region list, so the two never
+                    # disagree. jq folds per CODEPOINT and the ledger builder
+                    # folds per BYTE, but the byte fold replaces each whole
+                    # UTF-8 SEQUENCE rather than each byte, so the two produce
+                    # identical output with no trailing normalisation.
+                    # tests/pr-review-grounding.test.mjs runs them against every
+                    # non-ASCII line in the tree and fails on any disagreement.
+                    # THE GROUND FORM MUST STILL CARRY A BYTE. Every string
+                    # contains the empty string, so a quote that normalises
+                    # away would ground against anything at all. That was
+                    # unreachable while the alphabet excluded 0x22, because
+                    # nothing else in a printable-ASCII evidence string can be
+                    # deleted; admitting 0x22 makes an all-quote excerpt
+                    # normalise to nothing, and the byte-exact ledger builder
+                    # already refuses one (`not evidence`). Without this line
+                    # the loop validator would be LOOSER than the ledger
+                    # builder and the run would detonate after every chunk had
+                    # already been admitted, which is the exact crash the
+                    # loop-level pre-check exists to prevent.
                     and (
-                      (.evidence | strip_json_escapes) as $quote
-                      | $grounding | any(.[]; contains($quote))
+                      (.evidence | ground_form) as $quote
+                      | ($quote | utf8bytelength >= 1)
+                      and ($grounding | any(.[]; grounds($quote)))
                     )
                   )
                 )
@@ -1863,10 +2338,49 @@ jobs:
               # The reporter must never contradict the authority, so the two
               # definitions are transcribed from each other.
               def strip_json_escapes: split("\"") | join("") | split("\\") | join("");
+              # Same fold as validate_chunk_response, transcribed from it for
+              # the same reason as the deletion above: a reporter that folded
+              # differently from the authority would name a clause on a
+              # response the authority admitted, or stay silent on one it
+              # refused.
+              def ascii_fold:
+                split("\u2026") | join("...")
+                | split("\u2192") | join("->")
+                | split("\u2265") | join(">=")
+                | split("\u2264") | join("<=")
+                | split("\u2019") | join("\u0027")
+                | split("\u2018") | join("\u0027")
+                | split("\u201c") | join("")
+                | split("\u201d") | join("")
+                | split("\u00a0") | join(" ")
+                | split("\u2010") | join("-")
+                | split("\u2011") | join("-")
+                | split("\u2012") | join("-")
+                | split("\u2013") | join("-")
+                | split("\u2014") | join("-")
+                | split("\u2015") | join("-")
+                | split("\u2212") | join("-")
+                | split("\u2500") | join("-")
+                | split("\u2501") | join("-");
+              def ground_form: strip_json_escapes | ascii_fold;
+              # Same LINE-JOIN renderings as the authority, transcribed from it
+              # for the same reason as the deletion above: a reporter grounding
+              # in fewer renderings than the validator would name this clause on
+              # a response the validator admitted. The full rationale, the
+              # admitted set and every refusal it preserves are stated once, at
+              # the head of validate_chunk_response.
+              def side_join($lead):
+                split("\n")
+                | map(if startswith($lead) then .[1:] else "\u0000" end)
+                | join("");
+              def grounds_joined($quote):
+                [side_join("+"), side_join("-"), side_join(" ")]
+                | any(.[]; contains($quote));
+              def grounds($quote): contains($quote) or grounds_joined($quote);
               # Same grounding SET as the authority, for the same reason: a
               # reporter grounding in fewer regions than the validator would
               # name a clause on a response the validator admitted.
-              (($context[0] + [$chunk]) | map(strip_json_escapes)) as $grounding |
+              (($context[0] + [$chunk]) | map(ground_form)) as $grounding |
               (.choices[0].message.content // "") as $raw |
               (try ({parsed: true, body: ($raw | fromjson)}) catch {parsed: false, body: null}) as $parse |
               $parse.body as $body |
@@ -1939,9 +2453,22 @@ jobs:
                   $body.interface_facts | all(.[]; .evidence
                     | type == "string"
                       and utf8bytelength >= 1 and utf8bytelength <= 96)),
-                clause("facts-evidence-json-safe-ascii";
+                clause("facts-evidence-serialised-bytes-max-98";
                   $body.interface_facts | all(.[]; .evidence
-                    | explode | all((. >= 32 and . <= 126) and . != 34 and . != 92))),
+                    | tojson | utf8bytelength <= 98)),
+                # RENAMED from `facts-evidence-json-safe-ascii`. The old name
+                # covered both 0x22 and 0x5C; evidence now admits 0x22, so a
+                # name promising JSON safety would overstate what is checked.
+                # Logs written before this change carry the old name.
+                clause("facts-evidence-printable-ascii-no-backslash";
+                  $body.interface_facts | all(.[]; .evidence
+                    | explode | all((. >= 32 and . <= 126) and . != 92))),
+                # Mirrors the validator conjunct of the same shape. Without it
+                # an excerpt that normalises to nothing would be refused by the
+                # authority and named by no clause here.
+                clause("facts-evidence-ground-form-nonempty";
+                  $body.interface_facts | all(.[];
+                    (.evidence | ground_form) | utf8bytelength >= 1)),
                 # RENAMED from `facts-evidence-grounded-in-chunk`, because the
                 # old name stated the defect: the grounding set is every region
                 # the prompt SHOWS, not the chunk alone. Logs and measurements
@@ -1950,8 +2477,8 @@ jobs:
                 # recorded here so that archaeology still resolves.
                 clause("facts-evidence-grounded-in-shown-region";
                   $body.interface_facts | all(.[];
-                    (.evidence | strip_json_escapes) as $quote
-                    | $grounding | any(.[]; contains($quote))))
+                    (.evidence | ground_form) as $quote
+                    | $grounding | any(.[]; grounds($quote))))
               ]
               | if length == 0 then "none-identified" else join(",") end
             ' \
@@ -2001,7 +2528,48 @@ jobs:
             local context_path="${3:?the shown-context regions file is required}"
             jq -r '
               def strip_json_escapes: split("\"") | join("") | split("\\") | join("");
-              (($context[0] + [$chunk]) | map(strip_json_escapes)) as $shown |
+              # Same deletion and same fold as validate_chunk_response. A
+              # diagnostic that folded differently from the authority would
+              # print shown_in=none for a citation the authority accepted,
+              # which is precisely the misreading this function exists to
+              # prevent.
+              def ascii_fold:
+                split("\u2026") | join("...")
+                | split("\u2192") | join("->")
+                | split("\u2265") | join(">=")
+                | split("\u2264") | join("<=")
+                | split("\u2019") | join("\u0027")
+                | split("\u2018") | join("\u0027")
+                | split("\u201c") | join("")
+                | split("\u201d") | join("")
+                | split("\u00a0") | join(" ")
+                | split("\u2010") | join("-")
+                | split("\u2011") | join("-")
+                | split("\u2012") | join("-")
+                | split("\u2013") | join("-")
+                | split("\u2014") | join("-")
+                | split("\u2015") | join("-")
+                | split("\u2212") | join("-")
+                | split("\u2500") | join("-")
+                | split("\u2501") | join("-");
+              def ground_form: strip_json_escapes | ascii_fold;
+              # Same LINE-JOIN renderings as the authority, and reported
+              # SEPARATELY from a raw containment: a quote matched only after
+              # the line breaks and diff leads were deleted is recorded as
+              # `shown_in=chunk-joined` rather than `shown_in=chunk`. That
+              # distinction is the datum the 2026-08-22 no-verdict instances
+              # lacked -- `shown_in=none` could not say whether the model had
+              # invented a quote or joined two real lines, and those need
+              # opposite repairs. The suffix is APPENDED to the region name, so
+              # every earlier assertion on `shown_in=<region>` still holds.
+              def side_join($lead):
+                split("\n")
+                | map(if startswith($lead) then .[1:] else "\u0000" end)
+                | join("");
+              def grounds_joined($quote):
+                [side_join("+"), side_join("-"), side_join(" ")]
+                | any(.[]; contains($quote));
+              (($context[0] + [$chunk]) | map(ground_form)) as $shown |
               ["file", "hunk", "overlap", "chunk"] as $names |
               ($shown | length) as $region_count |
               (.choices[0].message.content // "") as $raw |
@@ -2020,14 +2588,15 @@ jobs:
                 | to_entries[]
                 | .key as $position
                 | ((.value.evidence // "") | tostring) as $evidence
-                | ($evidence | strip_json_escapes) as $quote
+                | ($evidence | ground_form) as $quote
                 | [
-                    range(0; $region_count)
-                    | select(
-                        $evidence != ""
-                        and ($shown[.] | contains($quote))
-                      )
-                    | $names[.]
+                    range(0; $region_count) as $i
+                    | if $evidence == "" then empty
+                      elif ($shown[$i] | contains($quote)) then $names[$i]
+                      elif ($shown[$i] | grounds_joined($quote))
+                        then $names[$i] + "-joined"
+                      else empty
+                      end
                   ] as $hits
                 | "  citation " + (($position + 1) | tostring)
                   + ": shown_in="
@@ -2451,6 +3020,65 @@ jobs:
                                   + "and 1-64 UTF-8 bytes. Abbreviate rather than exceed."
                                 )
                               },
+                              # THE DOUBLE-QUOTE IS CITABLE, AND THE LENGTH CAP
+                              # IS WHAT PAYS FOR IT. Constrained decoding cannot
+                              # emit a byte the pattern excludes, so while this
+                              # class excluded 0x22 the model had to TRANSFORM a
+                              # quoted line while copying it, and it got that
+                              # wrong on real input: on run 31812396266 chunk 2
+                              # it rendered a quoted shell test three times as
+                              # `if [ n -lt 290 ]; then`, then once with the
+                              # variable gone entirely, never as the corpus
+                              # form, and the gate recorded no verdict at all.
+                              # The same responses quoted a bracketed expansion
+                              # from the next source line correctly, so this is
+                              # a reliable failure on some shapes rather than a
+                              # total block. The cure is to stop asking for a
+                              # transformation: 0x22 is inside the class now and
+                              # the model copies the bytes it was shown.
+                              #
+                              # A SECOND CAP PAYS FOR IT, and that is
+                              # arithmetic rather than caution. A double-quote
+                              # is ONE byte raw and TWO once the response is
+                              # JSON-serialised, and both budgets that bound
+                              # this field are measured on the serialised form:
+                              # the canonical response at 1024 bytes and the
+                              # interface ledger at 10400. Widening the class
+                              # and changing nothing else takes the
+                              # schema-maximal worst case from 962 to 1154
+                              # canonical bytes and from 9985 to 13057 ledger
+                              # bytes -- over BOTH, which is the
+                              # unsatisfiable-bound defect the 2-fact cap
+                              # further down exists to prevent: the schema
+                              # would emit bodies its own validator rejects and
+                              # burn every retry, and the ledger builder would
+                              # detonate after every chunk had already been
+                              # admitted. So the validator bounds `tojson` of
+                              # this field at 98 bytes, holding the serialised
+                              # payload at the same 96 a quote-free excerpt
+                              # cost before, and both worst cases stay exactly
+                              # where they were: 962 and 9985.
+                              # tests/pr-review-grounding.test.mjs
+                              # recomputes all four numbers from the real
+                              # serialisers and fails if either budget moves.
+                              #
+                              # THE CHARACTER CAP STAYS AT 96 ON PURPOSE. A
+                              # flat cap of 48 would hold the same worst case
+                              # with no second clause, and it was measured and
+                              # rejected: it costs every citation half its
+                              # length and makes the 60-byte line the grounding
+                              # suite replays from run 31668217530 uncitable
+                              # again, undoing a fix this reviewer already
+                              # shipped. Graduated is the trade that keeps it.
+                              # RESIDUAL, stated rather than hidden: the
+                              # pattern bounds CHARACTERS and the clause bounds
+                              # SERIALISED BYTES, so an excerpt carrying more
+                              # than 96 minus its own length in double-quotes
+                              # is schema-legal and validator-rejected. It
+                              # costs a regeneration, the description states
+                              # the rule, and no real source line approaches
+                              # it; a flat 48 is the fallback if one ever does.
+                              #
                               # THE DELETE RULE LIVES HERE, NOT IN THE SYSTEM
                               # PROMPT, and that placement is measured rather
                               # than stylistic. enforce_message_boundary caps
@@ -2469,29 +3097,82 @@ jobs:
                               # already obeys for this field.
                               evidence: {
                                 type: "string",
-                                pattern: "^[ !#-[\\]-~]{1,96}$",
+                                pattern: "^[ !-[\\]-~]{1,96}$",
                                 description: (
                                   "A substring of ANY region shown to you above -- "
                                   + "UNTRUSTED_FILE, UNTRUSTED_HUNK, UNTRUSTED_OVERLAP "
                                   + "or the CORE diff chunk -- with every "
-                                  + "double-quote (\") and backslash (\\) DELETED. "
+                                  + "backslash (\\) DELETED. "
                                   + "The quote must lie inside ONE of those regions; "
                                   + "an excerpt spanning two of them is not a quote. "
-                                  + "Copy the bytes exactly, then remove those two "
-                                  + "characters and close up the gap. DELETE them; "
-                                  + "do NOT substitute anything for them -- not a "
-                                  + "single quote for a double quote, not a forward "
+                                  + "The double-quote character is an ORDINARY character "
+                                  + "here and you MUST copy it through unchanged, in the "
+                                  + "position it occupies in the source. Do not delete it, "
+                                  + "do not put a space where it stood, and above all do "
+                                  + "not drop the character beside it: a shell test on a "
+                                  + "quoted variable is copied with both of its "
+                                  + "double-quotes AND its dollar sign intact. "
+                                  + "Copy the bytes exactly, then remove backslashes "
+                                  + "and close up the gap. DELETE a backslash; "
+                                  + "do NOT substitute anything for it -- not a forward "
                                   + "slash for a backslash -- and do not re-word, "
                                   + "re-space or re-order anything else. The excerpt "
                                   + "is checked against each of those regions with the "
-                                  + "same two characters deleted, so deleting matches and "
+                                  + "same character deleted, so deleting matches and "
                                   + "substituting discards the whole reply. "
                                   + "Example: the chunk line "
-                                  + "print(\"a\\b\") must be quoted as print(ab). "
+                                  + "print(a\\b) must be quoted as print(ab). "
+                                  # THE LINE-BREAK RULE, stated because the
+                                  # model cannot see it. The pattern below
+                                  # admits bytes 32-126 only, so a newline is
+                                  # unrepresentable in this field -- and nothing
+                                  # said so. Faced with a construct spanning two
+                                  # lines the model joined them, deleted the
+                                  # newline AND each continued line diff lead,
+                                  # and its own grounding clause then refused
+                                  # the result: three deterministic no-verdict
+                                  # runs across two lanes on 2026-08-22. The
+                                  # rule is the SAME DELETE convention already
+                                  # stated above for the backslash, extended to
+                                  # the two characters a continued line begins
+                                  # with, and the grounding check
+                                  # applies the identical deletion to each
+                                  # region. Free to state: description travels
+                                  # in response_format, which
+                                  # enforce_message_boundary does not count.
+                                  + "A quote MAY span consecutive lines, but a "
+                                  + "line break cannot be written in this field. "
+                                  + "To quote across lines, DELETE each line "
+                                  + "break AND the single leading +, - or space "
+                                  + "of every continued line, and close up the "
+                                  + "gap; change nothing else. Never join an "
+                                  + "added (+) line to a removed (-) or context "
+                                  + "line -- lines joined in one quote must all "
+                                  + "carry the same leading character. When in "
+                                  + "doubt quote ONE line. "
+                                  + "SEPARATE RULE, for characters above byte 126 "
+                                  + "only: those cannot be emitted here at all, so "
+                                  + "RENDER them rather than delete them. An em dash "
+                                  + "or en dash becomes a single hyphen, an ellipsis "
+                                  + "becomes three dots, a rightwards arrow becomes "
+                                  + "->, a typographic single quote becomes the ASCII "
+                                  + "apostrophe, and a TYPOGRAPHIC double quote is "
+                                  + "deleted (the plain ASCII one is not). Each region is "
+                                  + "checked with exactly that rendering applied, so a "
+                                  + "rendered quote matches -- render an em or en dash as "
+                                  + "exactly ONE hyphen, never two, because runs of hyphens "
+                                  + "are NOT collapsed and -- will not match a single -. "
+                                  + "A line carrying one of those characters "
+                                  + "is quotable: render it rather than stopping the "
+                                  + "excerpt short. ANY OTHER character above byte 126, "
+                                  + "such as a check mark or an emoji, has NO rendering "
+                                  + "and cannot be quoted through; quote a span on one "
+                                  + "side of it instead. "
                                   + "HARD LIMITS, enforced on receipt: printable "
-                                  + "ASCII excluding double-quotes (\") and "
-                                  + "backslashes (\\) (bytes 32-33, 35-91, 93-126) "
-                                  + "and 1-96 UTF-8 bytes. Shorten the excerpt rather than exceed."
+                                  + "ASCII excluding backslashes (\\) "
+                                  + "(bytes 32-91, 93-126) "
+                                  + "and 1-96 UTF-8 bytes, counting each double-quote "
+                                  + "TWICE toward that 96. Shorten the excerpt rather than exceed."
                                 )
                               }
                             },
@@ -2520,7 +3201,28 @@ jobs:
             enforce_message_boundary "$request"
 
             for structured_attempt in 1 2 3 4; do
+              # THE CHUNK PHASE NOW NAMES ITS AVAILABILITY FAILURES, EXACTLY AS
+              # THE SYNTHESIS PHASE ALREADY DID.
+              #
+              # These two exits were the only model-call failures in the file
+              # that recorded no stage at all. The synthesis phase below has
+              # recorded `synthesis-transport` / `synthesis-api-error` for some
+              # time, but its chunk-phase counterparts were never instrumented,
+              # so every failure here fell through to the EXIT trap and was
+              # reported as `unclassified` -- a non-diagnosis -- even when the
+              # step had just printed an exact HTTP status. A missing or
+              # unscoped API key returns HTTP 401 on chunk 1 and took precisely
+              # this path, which is why an entirely mundane credential outage
+              # read for months as "the harness broke somewhere unknown".
+              #
+              # This changes NO verdict and relaxes NO bound. Both exits are
+              # still unconditional and still non-zero; the enforcement step
+              # classes these stages as availability failures, which are
+              # explicitly NOT findings about the change and are NOT eligible
+              # for publication.
               if ! http_status="$(call_models "$request" "$response")"; then
+                record_failure_stage "chunk-transport" \
+                  "chunk=${index}/${chunk_count}"
                 exit 1
               fi
               if [ "$http_status" != "200" ]; then
@@ -2538,6 +3240,13 @@ jobs:
                   head -c 300 "$response" | tr -cd '\40-\176' >&2
                   echo >&2
                 fi
+                # The status is curl's own %{http_code}, not anything the API
+                # said about itself, so it is safe to carry verbatim. It is the
+                # one datum that separates "nobody configured a key" (401) from
+                # "the account is out of quota" (429) from "the model name is
+                # wrong" (404), and the operator should not have to guess.
+                record_failure_stage "chunk-api-error" \
+                  "chunk=${index}/${chunk_count} http_status=${http_status}"
                 exit 1
               fi
               if validate_chunk_response "$response" "$index" \
@@ -2588,6 +3297,11 @@ jobs:
                     "$interface_fact_limit" "$chunk_nonce" "$chunk" \
                     "$chunk_context")" >&2
                 report_chunk_citations "$response" "$chunk" "$chunk_context" >&2
+                # Same class as `synthesis-schema`: four attempts produced
+                # nothing that satisfies the strict chunk schema. Never a
+                # verdict, never a finding about the change.
+                record_failure_stage "chunk-schema" \
+                  "chunk=${index}/${chunk_count} attempts=4"
                 exit 1
               fi
               # EVERY REJECTED ATTEMPT IS DIAGNOSED, NOT JUST THE LAST ONE.
@@ -2613,6 +3327,8 @@ jobs:
             if ! jq -jcS '.choices[0].message.content | fromjson' \
               "$response" > "$canonical_result" 2>/dev/null; then
               echo "Failed to materialize the canonical chunk response." >&2
+              record_failure_stage "chunk-schema" \
+                "chunk=${index}/${chunk_count} phase=canonicalize"
               exit 1
             fi
             chmod 0600 "$canonical_result"
@@ -2640,6 +3356,8 @@ jobs:
               | .canonical_content_sha256 = $canonical_content_sha256
             ' "$response" > "$result" 2>/dev/null; then
               echo "Failed to materialize the validated chunk response." >&2
+              record_failure_stage "chunk-schema" \
+                "chunk=${index}/${chunk_count} phase=materialize"
               exit 1
             fi
             chmod 0600 "$result"
@@ -2648,6 +3366,11 @@ jobs:
             test "$interface_facts_total" -le 32 || {
               printf 'Adversarial review chunk %s/%s failed post-parse assertion: interface_facts_total=%s (limit 32)\n' \
                 "$index" "$chunk_count" "$interface_facts_total" >&2
+              # One of the reviewer's OWN bounds, so it reuses the existing
+              # `chunk-assertion` stage rather than inventing a name; the
+              # enforcement step already reports that class correctly.
+              record_failure_stage "chunk-assertion" \
+                "chunk=${index}/${chunk_count} interface_facts_total=${interface_facts_total} limit=32"
               exit 1
             }
             completion_tokens_total=$((
@@ -2809,6 +3532,48 @@ jobs:
           import sys
           from pathlib import Path
 
+          # THE SAME FOLD validate_chunk_response APPLIES, TRANSCRIBED ONTO RAW
+          # BYTES. Read the long note at the head of that jq program for why it
+          # exists and what it deliberately does not fix.
+          #
+          # jq folds per CODEPOINT; this folds per BYTE -- but it replaces each
+          # whole UTF-8 SEQUENCE, not each byte, so a 3-byte em dash becomes ONE
+          # hyphen here exactly as it does there, and no trailing normalisation
+          # is needed to reconcile them. tests/pr-review-grounding.test.mjs runs
+          # the two against every non-ASCII line in the tree and fails on any
+          # disagreement, because a ledger builder stricter than the loop
+          # validator detonates after every chunk has already been admitted.
+          FOLD_TABLE = (
+              ("\u2026", "..."),
+              ("\u2192", "->"),
+              ("\u2265", ">="),
+              ("\u2264", "<="),
+              ("\u2019", "\u0027"),
+              ("\u2018", "\u0027"),
+              ("\u201c", ""),
+              ("\u201d", ""),
+              ("\u00a0", " "),
+              ("\u2010", "-"),
+              ("\u2011", "-"),
+              ("\u2012", "-"),
+              ("\u2013", "-"),
+              ("\u2014", "-"),
+              ("\u2015", "-"),
+              ("\u2212", "-"),
+              ("\u2500", "-"),
+              ("\u2501", "-"),
+          )
+
+
+          def ground_form(region):
+              region = region.replace(b'"', b"").replace(b"\\", b"")
+              for source, replacement in FOLD_TABLE:
+                  region = region.replace(
+                      source.encode("utf-8"), replacement.encode("ascii")
+                  )
+              return region
+
+
           result_dir, chunk_dir, manifest_path, ledger_path = map(
               Path, sys.argv[1:]
           )
@@ -2828,10 +3593,11 @@ jobs:
               ):
                   raise ValueError("chunk fact binding differs")
               chunk = (chunk_dir / entry["filename"]).read_bytes()
-              # The SAME deletion validate_chunk_response applies, over the SAME
-              # region list, transcribed onto the raw bytes. Both sides of the
-              # comparison go through it, and nothing else is normalised -- no
-              # whitespace, no case, no ordering -- so this stays a byte-exact
+              # The SAME deletion and fold validate_chunk_response applies, over
+              # the SAME region list, transcribed onto the raw bytes. Both sides
+              # of the comparison go through it, and nothing BEYOND that
+              # deletion and fold is normalised -- no whitespace folding, no
+              # case folding, no reordering -- so this stays a byte-exact
               # substring test against a deterministic function of the bytes the
               # model was shown, not a fuzzy match.
               #
@@ -2850,9 +3616,40 @@ jobs:
                   entry["overlap_before"].encode("utf-8"),
                   chunk,
               ]
-              grounding = [
-                  region.replace(b'"', b"").replace(b"\\", b"")
-                  for region in shown
+              grounding = [ground_form(region) for region in shown]
+
+              # LINE-JOIN RENDERINGS -- transcribed from validate_chunk_response,
+              # where the rationale, the admitted set and every preserved refusal
+              # are stated in full. Byte-for-byte the same function: keep the
+              # lines carrying `lead`, delete the lead and the line break, and
+              # replace every line of any other side with a NUL barrier.
+              #
+              # THIS MUST NOT LAG THE LOOP CHECK. The two run in different
+              # processes on the same rule, and this one is the byte-exact
+              # authority whose failure is an uncaught ValueError -- so a loop
+              # check that admits what this refuses does not merely disagree, it
+              # reproduces the exact no-verdict crash the loop check exists to
+              # prevent, one stage later and after every chunk has passed.
+              def _side_join(region: bytes, lead: bytes) -> bytes:
+                  return b"".join(
+                      line[1:] if line.startswith(lead) else b"\x00"
+                      for line in region.split(b"\n")
+                  )
+
+              def _renderings(region: bytes) -> list:
+                  return [
+                      region,
+                      _side_join(region, b"+"),
+                      _side_join(region, b"-"),
+                      _side_join(region, b" "),
+                  ]
+
+              # Materialised once per chunk, outside the fact loop, exactly as
+              # `grounding` is: recomputing it per fact would be the same list.
+              renderings = [
+                  rendering
+                  for region in grounding
+                  for rendering in _renderings(region)
               ]
               for fact in result["interface_facts"]:
                   # BYTE-EXACT AUTHORITY, deliberately UNRELAXED.
@@ -2882,15 +3679,21 @@ jobs:
                   # searching the join would admit a quote straddling a
                   # boundary -- a string that was never displayed anywhere --
                   # which is fabrication with extra steps.
-                  evidence = (
-                      fact["evidence"]
-                      .encode("ascii")
-                      .replace(b'"', b"")
-                      .replace(b"\\", b"")
-                  )
+                  evidence = ground_form(fact["evidence"].encode("ascii"))
+                  # PRINTABLE-ASCII FLOOR, asserted HERE rather than inherited.
+                  #
+                  # The NUL barrier in _side_join is only a barrier while a
+                  # citation cannot contain a NUL. jq clause
+                  # `facts-evidence-json-safe-ascii` already guarantees that --
+                  # but it runs in another process, and this block is the
+                  # byte-exact AUTHORITY, whose whole point is not to rest on a
+                  # clause it cannot see. `.encode("ascii")` accepts byte 0, so
+                  # without this line a response carrying an escaped NUL could
+                  # step across the barrier here and nowhere else. One line, and
+                  # the barrier becomes self-guaranteeing on both sides.
                   if not evidence or not any(
-                      evidence in region for region in grounding
-                  ):
+                      evidence in rendering for rendering in renderings
+                  ) or not all(32 <= b <= 126 for b in evidence):
                       raise ValueError(
                           "interface evidence is not an exact substring of any "
                           "region shown to the chunk reviewer"
@@ -3096,6 +3899,8 @@ jobs:
           review_manifest_bytes="$(wc -c < "$review_manifest")"
           if [ "$review_manifest_bytes" -gt 50000 ]; then
             echo "Review evidence exceeds 50000 bytes; use an independent review path." >&2
+            record_failure_stage "aggregate-assertion" \
+              "review_manifest_bytes=${review_manifest_bytes} limit=50000"
             exit 1
           fi
 
@@ -3798,9 +4603,22 @@ jobs:
           # from outputs the review step writes only on success. On the failure
           # path they are all empty strings, the regex battery rejects them, and
           # the operator gets a second red step reporting nothing but blanks.
-          # These four say what actually happened, so the step can report the
+          # These five say what actually happened, so the step can report the
           # real outcome instead of validating a void.
+          CLAUDE_FAILURE_DETAIL: ${{ steps.claude.outputs.failure-detail }}
           CLAUDE_FAILURE_STAGE: ${{ steps.claude.outputs.failure-stage }}
+          # THE TWO EARLIER PHASES' DIAGNOSTIC CHANNELS. When the source or
+          # chunk-building step dies, the model step is SKIPPED, so every
+          # `steps.claude.*` value above is the empty string and the stage
+          # resolved to `unreported` -- which this step then printed as a
+          # failure of the model step. These carry the truth from the step that
+          # actually died. They are consulted ONLY on the failure path and only
+          # through a prefix-locked allowlist below, so they can never name a
+          # publishable stage.
+          CHUNKS_FAILURE_DETAIL: ${{ steps.chunks.outputs.failure-detail }}
+          CHUNKS_FAILURE_STAGE: ${{ steps.chunks.outputs.failure-stage }}
+          SOURCE_FAILURE_DETAIL: ${{ steps.source.outputs.failure-detail }}
+          SOURCE_FAILURE_STAGE: ${{ steps.source.outputs.failure-stage }}
           CLAUDE_OBJECTION_B64: ${{ steps.claude.outputs.objection-b64 }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           EXPECTED_BASE_REF: ${{ steps.source.outputs.base-ref }}
@@ -3837,6 +4655,31 @@ jobs:
           # the exit is unconditional, and an unrecognised stage exits 1 too.
           if [ "$CLAUDE_OUTCOME" != "success" ]; then
             stage="${CLAUDE_FAILURE_STAGE:-unreported}"
+            detail="${CLAUDE_FAILURE_DETAIL:-}"
+            # FALL BACK TO THE STEP THAT ACTUALLY DIED, IN REVERSE STEP ORDER.
+            #
+            # Consulted ONLY when the model step recorded no stage at all,
+            # which is precisely the case where it never ran. The model step
+            # therefore keeps absolute precedence and NOTHING here can displace
+            # a `merit` or an `injection`.
+            #
+            # Each candidate must match its own step's PREFIX, not merely the
+            # generic stage alphabet. That is the fail-closed part: `merit` and
+            # `injection` are the only publishable stages, neither carries a
+            # `source-`/`chunks-` prefix, and so no value arriving on these two
+            # channels can ever reach the publication guard below -- which in
+            # any case still requires a structured `fail` that only the model
+            # step can produce. A malformed value matches no prefix, is
+            # ignored, and leaves `unreported` standing.
+            if [ -z "${CLAUDE_FAILURE_STAGE:-}" ]; then
+              if [[ "${CHUNKS_FAILURE_STAGE:-}" =~ ^chunks-[a-z-]{1,24}$ ]]; then
+                stage="$CHUNKS_FAILURE_STAGE"
+                detail="${CHUNKS_FAILURE_DETAIL:-}"
+              elif [[ "${SOURCE_FAILURE_STAGE:-}" =~ ^source-[a-z-]{1,24}$ ]]; then
+                stage="$SOURCE_FAILURE_STAGE"
+                detail="${SOURCE_FAILURE_DETAIL:-}"
+              fi
+            fi
             # Bound the untrusted-ish stage name before it is printed. It is
             # written by this workflow, never by a model, but it arrives through
             # a step output and a closed alphabet costs nothing.
@@ -3854,9 +4697,46 @@ jobs:
                 echo "Adversarial review: the reviewer did NOT reach a verdict; one of its own bounds was exceeded (stage=${stage})." >&2
                 echo "This is a reviewer/tooling failure, NOT a finding about this change." >&2
                 ;;
-              synthesis-transport|synthesis-api-error|synthesis-schema)
+              synthesis-transport|synthesis-api-error|synthesis-schema|\
+              chunk-transport|chunk-api-error|chunk-schema)
                 echo "Adversarial review: the reviewer did NOT reach a verdict; the model call failed or returned nothing usable (stage=${stage})." >&2
                 echo "This is an availability failure, NOT a finding about this change. An EMPTY response is this case, never a substantive fail." >&2
+                # The chunk-phase stages are new only to this REPORT: the
+                # failures themselves always existed and always exited non-zero.
+                # They previously arrived here unnamed and were printed as
+                # `unclassified`, which reads as "the harness is broken" and
+                # sent operators to debug the reviewer when the actual cause
+                # was, for example, an absent API key answering HTTP 401 on the
+                # very first chunk. Naming them changes no verdict: this arm
+                # publishes nothing and falls through to the same unconditional
+                # non-zero exit as every other failure stage.
+                if [ "$stage" = "chunk-api-error" ]; then
+                  echo "An HTTP status is printed below. 401 means the reviewer's model credential is absent, empty or unscoped -- check that the OPENAI_API_KEY repository secret exists; 429 means quota or rate limit; 404 usually means the configured model name is not available to this account." >&2
+                fi
+                ;;
+              source-conflicted-merge)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; there is no single tree to review (stage=${stage})." >&2
+                echo "The head does not merge cleanly into the reviewed base. This is a state of the branch, NOT a finding about this change: merge or rebase the base branch into the pull request branch and push." >&2
+                ;;
+              source-stale-event)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; the base moved after this run was dispatched (stage=${stage})." >&2
+                echo "This is an ordinary race, NOT a finding about this change. The next event on this pull request reviews the new base." >&2
+                ;;
+              source-not-reviewable)
+                echo "Adversarial review: the reviewer DECLINED to review (stage=${stage})." >&2
+                echo "A draft, or a do-not-merge label. Nothing is wrong with this change and nothing was reviewed. The check is red only because a GitHub Actions job cannot conclude neutral; the notice annotation on the source step carries the disposition." >&2
+                ;;
+              source-pull-request-rejected|source-acquisition-bound)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; the pull request is outside what this reviewer admits (stage=${stage})." >&2
+                echo "This is a reviewer/tooling boundary, NOT a finding about this change. Read the source step log above for the clause or the bound that rejected." >&2
+                ;;
+              kill-switch)
+                echo "Adversarial review: CANCELLED by the global kill switch (stage=${stage})." >&2
+                echo "The reviewer did NOT reach a verdict and did NOT call the model. This is the control working, NOT a finding about this change and NOT a model outage: do not investigate the model endpoint. The detail below says whether the switch read 'off' or could not be read at all -- an unreadable switch is treated as ENGAGED, which is the direction a kill switch has to fail." >&2
+                ;;
+              source-assertion|source-unclassified|chunks-manifest|chunks-unclassified)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; it died before any model call (stage=${stage})." >&2
+                echo "This is a reviewer/tooling failure, NOT a finding about this change. The stage names the STEP that died -- \`source-\` is 'Materialize complete immutable pull request data', \`chunks-\` is 'Build bounded complete review chunks' -- so expand that step, not the model step." >&2
                 ;;
               *)
                 echo "Adversarial review: the review step failed at an unclassified point (stage=${stage})." >&2
@@ -3865,6 +4745,20 @@ jobs:
             esac
             printf 'structured verdict: %s\n' "${STRUCTURED_VERDICT:-<none recorded>}" >&2
             printf 'reviewer model: %s\n' "${EXPECTED_MODEL:-<none recorded>}" >&2
+            # Re-validated on arrival rather than trusted across the step
+            # boundary, in the same spirit as the objection below: the producer
+            # already bounds this alphabet, and the consumer refuses to rely on
+            # that. Anything malformed prints as "<none recorded>" instead of
+            # reaching the log.
+            # `detail` is whichever phase's detail accompanied the stage chosen
+            # above, so the two always describe the same death. Re-validated
+            # here regardless of which channel it arrived on.
+            if [ -n "${detail:-}" ] \
+              && [[ "$detail" =~ ^[A-Za-z0-9_=/.,\ -]{1,200}$ ]]; then
+              printf 'failure detail: %s\n' "$detail" >&2
+            else
+              printf 'failure detail: %s\n' "<none recorded>" >&2
+            fi
             # Re-emitted HERE, not merely referenced, because a reviewer arrives
             # at the LAST failed step from the checks tab and should not have to
             # know which earlier step to expand.
@@ -4692,7 +5586,13 @@ jobs:
               and .status == "in_progress"
               and .conclusion == null
             ' "$run_file" >/dev/null
+            # Same HTTPS-only, bounded-redirect posture as the job-start check
+            # and the per-request check in the model step. See the comment on
+            # "Enforce global kill switch" for why `--location` alone is not
+            # enough. Under `set -euo pipefail` a refused hop aborts publication
+            # rather than reading as "switch is off".
             state="$(curl --fail --silent --show-error --location \
+              --proto '=https' --proto-redir '=https' --max-redirs 2 \
               --max-time 15 --retry 2 \
               https://raw.githubusercontent.com/jbutler1980/agent-ops-flags/main/state \
               | tr -d '[:space:]')"
