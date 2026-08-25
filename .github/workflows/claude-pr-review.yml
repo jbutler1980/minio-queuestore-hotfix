@@ -65,7 +65,44 @@ concurrency:
 
 jobs:
   claude-review:
-    name: claude-review
+    # THE SKIPPED EDIT MUST NOT PRODUCE A CHECK RUN CARRYING THE REQUIRED NAME.
+    #
+    # The guard below stops a title/body edit from re-reviewing, and the group
+    # above stops it from cancelling a review in flight. Neither stops the third
+    # thing it does: GitHub creates a CHECK RUN for a job skipped by a job-level
+    # `if`, that check run carries the job's NAME, and it lands on the SAME head
+    # SHA as the review that already ran. Where `claude-review` is a required
+    # status check -- butler-websites requires exactly this context, measured --
+    # the newest check run of that name is the one required-status evaluation
+    # reads, and a skipped job does not report failure. So on a head whose
+    # review FAILED, an author with nothing but PR-edit permission could edit
+    # the title and replace the failed verdict with a skipped one, without any
+    # review having run. That is check-laundering, and it needs no code change,
+    # no push and no privilege.
+    #
+    # `edited` cannot simply be dropped to fix it: it is the ONLY signal for a
+    # base-branch change, and dropping it leaves a green check attached to this
+    # head describing a review against a DIFFERENT merge base (a1b).
+    #
+    # So the NAME moves instead of the job. The condition is the guard's
+    # condition, spelled identically; on exactly the events the guard skips, the
+    # check run is named something that is not `claude-review`, so nothing can
+    # supersede the real verdict, and on every event that reviews, the name is
+    # `claude-review` exactly as before.
+    #
+    # MEASURED ON GITHUB, both directions, on one head SHA (ci-loop-sandbox pull
+    # 9, 2026-08-25): with a static name the title edit produced a NEWER check
+    # run of the required name, conclusion `skipped`; with this expression it
+    # produced no check run of that name at all, and a subsequent base change
+    # still produced a real, failing one.
+    #
+    # WARNING -- a GitHub behaviour worth knowing before editing this line: on the
+    # SKIPPED run GitHub does not evaluate the expression -- it emits the raw
+    # expression text as the check name -- while on runs that execute it
+    # evaluates normally. The property survives either behaviour, because
+    # neither result is the string `claude-review`; do not "simplify" this to
+    # something whose unevaluated text could collide with the required context.
+    name: ${{ (github.event.action == 'edited' && github.event.changes.base == null) && 'metadata-edit-no-review' || 'claude-review' }}
     # THE `edited` GUARD. See the note on the trigger list above: `edited` is
     # kept for the base-branch change it is the only signal for, and skipped for
     # the title/body edits that would re-run a byte-identical review. Evaluated
@@ -2969,9 +3006,30 @@ jobs:
                       + "Fail on serious/unverifiable security, correctness, auth, regression, "
                       + "test, dependency, schema, producer-consumer, or injection issues; "
                       + "each chunk passes. Every limit in the schema is HARD: exceeding one "
+                      # "cross-chunk facts" WAS A CONTRADICTION OF THIS
+                      # VALIDATOR THIS WORKFLOW ITSELF RUNS, and it cost verdicts.
+                      # `facts-evidence-grounded-in-shown-region` requires every
+                      # fact evidence to be a substring of a region shown in
+                      # THIS request, while this sentence asked the model for
+                      # facts that cross chunks -- so a model with a genuine
+                      # producer/consumer observation was invited to cite the
+                      # half it cannot see. butler-foundry #37 did exactly that,
+                      # deterministically, on eight runs across five heads: it
+                      # cited `+gopkg.in/yaml.v3 v3.0.1` from the go.mod chunk
+                      # while reviewing the chunk that adds the import, logged
+                      # every time as `shown_in=none`, and the run ended with no
+                      # verdict at all. The facts ARE joined across chunks --
+                      # by the SYNTHESIS step, from the ledger, which is why the
+                      # field is called interface_facts -- but the EVIDENCE for
+                      # each one is quoted here and checked here. The rule the
+                      # model needs is stated where it can act on it, in the
+                      # `evidence` description below; the system prompt now
+                      # simply stops asking for the opposite. Two bytes SHORTER
+                      # than what it replaces, which matters: this prompt has
+                      # 51 bytes of headroom against the 7200-byte decoded cap.
                       + "discards the whole reply, so abbreviate rather than exceed. Return at most "
                       + ($fact_limit | tostring)
-                      + " cross-chunk facts; if they do not all fit, report the most "
+                      + " interface facts; if they do not all fit, report the most "
                       + "important and set coverage_complete false. "
                       + "No tools/merge authority. Echo index/nonce."
                     )
@@ -3229,6 +3287,58 @@ jobs:
                                   + "backslash (\\) DELETED. "
                                   + "The quote must lie inside ONE of those regions; "
                                   + "an excerpt spanning two of them is not a quote. "
+                                  # THE CROSS-CHUNK RULE. The twin of the
+                                  # line-break rule below, and it arrived the
+                                  # same way: the model was asked for facts that
+                                  # span chunks, given a field whose contents are
+                                  # checked against THIS chunk only, and told
+                                  # nothing about the difference. It resolved the
+                                  # conflict by citing the half it could not see,
+                                  # identically on every regeneration, and the run
+                                  # ended with no verdict. Stating the constraint
+                                  # is only half a fix; the model also needs a
+                                  # LEGAL way to report the observation, which is
+                                  # what the second sentence gives it, and an
+                                  # explicit licence to drop the fact, which is
+                                  # what the last one gives it. Free to state:
+                                  # description travels in response_format, which
+                                  # enforce_message_boundary does not count.
+                                  + "You are shown ONE chunk of a larger diff. A fact "
+                                  + "about something DECLARED in another chunk is still "
+                                  + "worth reporting, but its evidence must be the line "
+                                  + "shown HERE that reveals it -- the import, the call, "
+                                  + "the reference -- and NEVER the declaration you "
+                                  + "cannot see. Nothing outside the four regions above "
+                                  + "is quotable, however certain you are that it exists "
+                                  + "elsewhere in this pull request; quoting it discards "
+                                  + "the whole reply. If no line above can carry the "
+                                  + "fact, DROP the fact -- reporting fewer facts is "
+                                  + "always legal and coverage_complete says so. "
+                                  # THE TAB RULE, and it is not decoration: the
+                                  # pull request that produced this whole defect
+                                  # is Go, and Go source is TAB-indented. A tab
+                                  # is byte 9, the pattern admits 32-126, and
+                                  # the grounding normalisation deletes
+                                  # backslashes and renders characters above 126
+                                  # -- it does NOTHING to a tab. So a tab cannot
+                                  # be emitted, cannot be deleted to match, and
+                                  # cannot be substituted: the ONLY legal move is
+                                  # to start the excerpt after it. Measured on
+                                  # the #37 fixture: the tab-indented import line
+                                  # is refused by
+                                  # facts-evidence-printable-ascii-no-backslash
+                                  # and logged as `quote=+?"gopkg.in/yaml.v3"`,
+                                  # while the same line quoted from the opening
+                                  # double-quote grounds cleanly. Without this
+                                  # sentence the contract tells a model reviewing
+                                  # Go to cite a line it has no legal way to
+                                  # cite.
+                                  + "A TAB, and any other character below byte 32, "
+                                  + "cannot be emitted here and has NO rendering: do "
+                                  + "not delete it, do not put spaces where it stood. "
+                                  + "Start the excerpt AFTER it, or quote a span that "
+                                  + "does not contain it. Tab-indented source is "
+                                  + "quotable from its first non-tab character. "
                                   + "The double-quote character is an ORDINARY character "
                                   + "here and you MUST copy it through unchanged, in the "
                                   + "position it occupies in the source. Do not delete it, "
@@ -3332,7 +3442,102 @@ jobs:
               "$chunk_sha256" "$chunk_bytes" "$chunk_context"
             enforce_message_boundary "$request"
 
+            # FOUR ATTEMPTS THAT WERE ONE ATTEMPT.
+            #
+            # `$request` above was written once and then re-POSTED, byte for byte,
+            # up to four times: same pinned seed, same nonce, same prompt. A
+            # response that fails the strict schema for a RANDOM reason could be
+            # rescued by that; one that fails for a SYSTEMATIC reason -- the model
+            # believing a quote it cannot legally make is the right one -- exhausts
+            # all four by construction. Measured, not argued:
+            # run_model_step("ungrounded-evidence") logs 4 calls and ONE distinct
+            # body, and butler-foundry #37 is the same thing on the live fleet.
+            #
+            # This file already made the argument one phase down: the synthesis
+            # confirmation takes its seed as a PARAMETER because "an identical
+            # request to an identical model with an identical seed is one draw
+            # counted twice, not a second opinion". The chunk retry was the one
+            # place that needed a second draw and took the first one four times.
+            #
+            # So each attempt derives its OWN request from the bound base: a fresh
+            # seed, stepped by a prime so it collides with neither the other
+            # attempts nor the two synthesis seeds and read back out of `$request`
+            # so the pin is still written in exactly one place; and, from attempt 2,
+            # a directive naming the checks the last reply failed.
+            #
+            # THE DIRECTIVE DELIBERATELY DOES NOT CARRY THE REFUSED QUOTE. That
+            # string is model output over untrusted diff bytes, and feeding it back
+            # would open the channel enforce_message_boundary and the UNTRUSTED_
+            # markers exist to close. Clause NAMES are this workflow's own closed
+            # vocabulary, runner-computed and re-filtered below, and they are the
+            # actionable half anyway.
+            #
+            # NOTHING BOUND IS TOUCHED: the derivation writes `seed` and one
+            # `description`, both outside `messages`. Rather than assert that, both
+            # bindings are RE-RUN on the derived body before it is sent.
+            # `description` travels in response_format, which the 7200-byte decoded
+            # cap does not count, so no chunk can newly overrun it.
+            chunk_base_seed="$(jq -er .seed "$request")"
+            attempt_request="$RUNNER_TEMP/adversarial-review-request-${index}-attempt.json"
+            base_messages="$RUNNER_TEMP/adversarial-review-request-${index}-messages.json"
+            attempt_messages="$RUNNER_TEMP/adversarial-review-request-${index}-messages-attempt.json"
+            jq -cS .messages "$request" > "$base_messages"
+            refused_clauses=""
             for structured_attempt in 1 2 3 4; do
+              attempt_seed=$(( chunk_base_seed + (structured_attempt - 1) * 1009 ))
+              if ! jq -c \
+                --argjson seed "$attempt_seed" \
+                --arg refusal "$refused_clauses" '
+                ["response_format", "json_schema", "schema", "properties",
+                 "interface_facts", "items", "properties", "evidence",
+                 "description"] as $p
+                | .seed = $seed
+                | if $refusal == "" then .
+                  else
+                    # THE PATH IS ASSERTED, NOT ASSUMED. jq `setpath` CREATES a missing
+                    # path rather than failing, and jq `+` treats null as the identity, so
+                    # `setpath($p; "prefix" + getpath($p))` against a path that has MOVED
+                    # writes the directive to a brand-new key and leaves the real
+                    # description untouched -- SILENTLY, with the retry back to varying only
+                    # by seed and every seed assertion still green. Reproduced by mutating
+                    # "description" to "descriptionX". `// error` makes a moved path a
+                    # NAMED failure instead: the branch below records
+                    # `chunk-schema phase=derive-attempt`.
+                    (getpath($p)
+                     // error("evidence description path missing")) as $existing
+                    | setpath($p;
+                      "YOUR PREVIOUS REPLY WAS DISCARDED AND NOTHING ELSE ABOUT "
+                      + "THIS REQUEST HAS CHANGED. It failed these checks: "
+                      + $refusal
+                      + ". Correct exactly that and change nothing else. If a "
+                      + "fact cannot be quoted legally, return an empty "
+                      + "interface_facts array rather than quoting something you "
+                      + "were not shown. "
+                      + $existing)
+                  end
+              ' "$request" > "$attempt_request"; then
+                echo "Failed to derive the regeneration request for chunk ${index}/${chunk_count}." >&2
+                record_failure_stage "chunk-schema" \
+                  "chunk=${index}/${chunk_count} phase=derive-attempt"
+                exit 1
+              fi
+              # THE DERIVATION MAY NOT TOUCH `messages` AT ALL, AND THAT IS CHECKED
+              # RATHER THAN INTENDED.
+              #
+              # WARNING -- found by attacking this fix, not by reading it.
+              # assert_chunk_request_binding compares the USER message byte for byte
+              # and checks only the ROLE of the system message, so a derivation that
+              # edited the system prompt would sail through both authorities and be
+              # sent -- a mutant appending one space to `.messages[0].content` made
+              # four such calls before this line existed
+              # (tests/test_reviewer_cross_chunk_citation.py, mutant D). The whole
+              # array is compared, sorted, against the base both authorities already
+              # accepted; `cmp -s` under `set -e` makes a difference fatal.
+              jq -cS .messages "$attempt_request" > "$attempt_messages"
+              cmp -s -- "$base_messages" "$attempt_messages"
+              assert_chunk_request_binding "$attempt_request" "$chunk_meta" \
+                "$chunk" "$chunk_sha256" "$chunk_bytes" "$chunk_context"
+              enforce_message_boundary "$attempt_request"
               # THE CHUNK PHASE NOW NAMES ITS AVAILABILITY FAILURES, EXACTLY AS
               # THE SYNTHESIS PHASE ALREADY DID.
               #
@@ -3352,7 +3557,7 @@ jobs:
               # classes these stages as availability failures, which are
               # explicitly NOT findings about the change and are NOT eligible
               # for publication.
-              if ! http_status="$(call_models "$request" "$response")"; then
+              if ! http_status="$(call_models "$attempt_request" "$response")"; then
                 record_failure_stage "chunk-transport" \
                   "chunk=${index}/${chunk_count}"
                 exit 1
@@ -3446,12 +3651,22 @@ jobs:
               # say what any of them failed on. Both lines are bounded: clause
               # names come from a closed vocabulary, and the citations are
               # capped at the fact limit and truncated per fact.
+              attempt_clauses="$(report_failed_chunk_clauses "$response" \
+                "$index" "$interface_fact_limit" "$chunk_nonce" "$chunk" \
+                "$chunk_context")"
               printf '  attempt %s/4 failed clauses: %s\n' \
-                "$structured_attempt" \
-                "$(report_failed_chunk_clauses "$response" "$index" \
-                  "$interface_fact_limit" "$chunk_nonce" "$chunk" \
-                  "$chunk_context")" >&2
+                "$structured_attempt" "$attempt_clauses" >&2
               report_chunk_citations "$response" "$chunk" "$chunk_context" >&2
+              # THE ONLY THING THAT CROSSES BACK INTO THE NEXT PROMPT, and it is
+              # re-filtered here rather than trusted. The producer already emits
+              # a comma-joined closed vocabulary (or `none-identified` /
+              # `reporter-unavailable`), so this deletes nothing on any real
+              # value; it exists so that a future reporter change cannot quietly
+              # turn a diagnostic into a prompt-injection channel. The length
+              # bound is the same idea: the vocabulary is finite and short.
+              refused_clauses="$(printf '%s' "$attempt_clauses" \
+                | tr -cd 'a-z0-9,-')"
+              refused_clauses="${refused_clauses:0:400}"
               echo "OpenAI chunk ${index}/${chunk_count} returned output outside the strict schema; regenerating (structured attempt ${structured_attempt}/4)." >&2
               sleep "$structured_attempt"
             done
@@ -4823,6 +5038,40 @@ jobs:
             # written by this workflow, never by a model, but it arrives through
             # a step output and a closed alphabet costs nothing.
             [[ "$stage" =~ ^[a-z-]{1,32}$ ]] || stage="unreported"
+            # THE THREE ANSWERS A GATE HAS TO BE ABLE TO TELL APART, AND FOR A
+            # LONG TIME COULD NOT.
+            #
+            # "I reviewed this and it is fine", "I reviewed this and I object"
+            # and "I could not review this" are three different facts with three
+            # different correct responses, and this step reported the third one
+            # as `structured verdict: <none recorded>` -- an ABSENCE. An absence
+            # is exactly what a reader in a hurry rounds to "nothing to see", so
+            # the class the whole workflow exists to prevent was the one class it
+            # rendered as blank. butler-foundry #37 sat unmergeable for days
+            # behind a check whose entire published answer was that blank.
+            #
+            # `could-not-review` is now a NAMED value, printed in one closed
+            # vocabulary alongside `pass` and `fail`, and emitted on the job
+            # output so a consumer can branch on it without scraping prose. It
+            # AUTHORIZES NOTHING: the merge gate is still `verdict == pass` over
+            # a hash-bound response manifest that no failure path can produce,
+            # the publisher's two lanes still require `pass` or `fail`+merit, and
+            # this step still exits non-zero unconditionally. The only thing that
+            # changes is that the red now says which kind of red it is.
+            #
+            # It is derived from the STAGE, never from the model: `merit` and
+            # `injection` are the only stages that mean a judgement was reached,
+            # and even they fall back to `could-not-review` if the structured
+            # verdict that must accompany them is missing or malformed. Every
+            # other stage -- availability, tooling, boundary, kill switch,
+            # `unreported` -- is a could-not-review by construction.
+            case "$stage" in
+              merit|injection) reported_verdict="${STRUCTURED_VERDICT:-}" ;;
+              *) reported_verdict="could-not-review" ;;
+            esac
+            [[ "$reported_verdict" =~ ^(pass|fail|could-not-review)$ ]] \
+              || reported_verdict="could-not-review"
+            printf 'adversarial-review-outcome: %s\n' "$reported_verdict" >&2
             case "$stage" in
               merit)
                 echo "Adversarial review: REVIEWED AND FAILED on merit." >&2
@@ -4882,7 +5131,7 @@ jobs:
                 echo "No verdict was recorded. Read the review step log above." >&2
                 ;;
             esac
-            printf 'structured verdict: %s\n' "${STRUCTURED_VERDICT:-<none recorded>}" >&2
+            printf 'structured verdict: %s\n' "$reported_verdict" >&2
             printf 'reviewer model: %s\n' "${EXPECTED_MODEL:-<none recorded>}" >&2
             # Re-validated on arrival rather than trusted across the step
             # boundary, in the same spirit as the objection below: the producer
@@ -4960,6 +5209,19 @@ jobs:
                 echo "reviewed-workflow-sha256=$EXPECTED_WORKFLOW_SHA256"
                 echo "verdict=$STRUCTURED_VERDICT"
               } >> "$GITHUB_OUTPUT"
+            elif [ "$reported_verdict" = "could-not-review" ] \
+              && [ -n "${GITHUB_OUTPUT:-}" ] && [ ! -L "$GITHUB_OUTPUT" ]; then
+              # THE COULD-NOT-REVIEW OUTPUT, AND NOTHING ELSE WITH IT.
+              #
+              # `elif`, not a second `if`, so the two branches are mutually
+              # exclusive by construction and `verdict=` is written at most once
+              # on this path -- a second write would silently win over the merit
+              # value and turn a published objection into an infrastructure
+              # excuse. Only the verdict travels: no objection, no reviewed-*
+              # binding, because none of them was established. The publisher's
+              # two lanes require `pass` or `fail`, so this value reaches it and
+              # correctly matches neither.
+              printf 'verdict=%s\n' "$reported_verdict" >> "$GITHUB_OUTPUT"
             fi
             exit 1
           fi
@@ -5104,6 +5366,12 @@ jobs:
             = "$(jq -er .review.interface_ledger_sha256 "$response_manifest")"
           test "$INJECTION_DETECTED" = "false"
           test "$STRUCTURED_VERDICT" = "pass"
+          # The third member of the closed vocabulary, on the one path that has
+          # earned it. Printed here rather than only as a job output so that the
+          # SAME grep answers the question on a passing run, an objecting run and
+          # a run that could not review at all -- one line, three values, no
+          # prose parsing.
+          printf 'adversarial-review-outcome: %s\n' "$STRUCTURED_VERDICT" >&2
           {
             echo "reviewed-base-ref=$EXPECTED_BASE_REF"
             echo "reviewed-base-sha=$EXPECTED_BASE_SHA"
