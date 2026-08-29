@@ -363,6 +363,17 @@ jobs:
               [ "$allowed_ref" \
                 = "$(git check-ref-format --branch "$allowed_ref" 2>/dev/null || true)" ] \
                 || continue
+              # ONE branch-name contract across admission and publication.
+              # `git check-ref-format --branch` admits a wider alphabet than the
+              # publication path can emit: the fail-verdict output step gates
+              # EXPECTED_BASE_REF on ^[A-Za-z0-9._/-]{1,512}$, so a merit or
+              # injection FAIL on an admitted ref carrying a valid Git character
+              # outside that set (e.g. `release/v1+hotfix`, `release@candidate`)
+              # would satisfy admission yet write no reviewed outputs -- the
+              # objection would survive only in the job log while publish is
+              # skipped. Requiring the SAME alphabet here makes admission and
+              # publication one contract: anything admitted can also be published.
+              [[ "$allowed_ref" =~ ^[A-Za-z0-9._/-]{1,512}$ ]] || continue
               [ "$allowed_ref" = "$PR_BASE_REF" ] || continue
               base_ref_admitted_via=configured-allowlist
               break
@@ -5622,6 +5633,22 @@ jobs:
           else
           test "$GITHUB_WORKFLOW_REF" = \
             "${GITHUB_REPOSITORY}/.github/workflows/claude-pr-review.yml@refs/heads/${DEFAULT_BRANCH}"
+          # DEFAULT-BRANCH LIVENESS on the configured-allowlist path. On the
+          # default path the reviewed base IS the default branch and
+          # GITHUB_WORKFLOW_SHA == EXPECTED_BASE_SHA proves the reviewer ran from
+          # the live protected head. On this path EXPECTED_BASE_SHA is the
+          # release head, so that proof is absent: workflow_ref naming the
+          # default branch shows WHICH ref ran, not that the ref still points at
+          # the bytes this run loaded. Resolve the default head authoritatively
+          # (once) and bind GITHUB_WORKFLOW_SHA to it, so a reviewer superseded
+          # after dispatch -- the default branch advanced to revoke this
+          # allowlist entry or ship a reviewer fix -- fails here and publishes
+          # nothing, exactly as the default path fails when workflow_sha drifts.
+          default_head_live="$(timeout --kill-after=5s 20s gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${DEFAULT_BRANCH}" \
+            --jq '.object.sha')"
+          [[ "$default_head_live" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_WORKFLOW_SHA" = "$default_head_live"
           fi
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           if [ "$publish_verdict" = "PASS" ]; then
@@ -6081,6 +6108,27 @@ jobs:
               and .object.type == "commit"
               and .object.sha == $base
             ' "$ref_file" >/dev/null
+            # DEFAULT-BRANCH LIVENESS, re-checked at EVERY publication boundary
+            # (this function runs at pre, publish AND final). workflow_ref naming
+            # the default branch -- asserted once up front -- shows WHICH ref ran,
+            # not that the default branch still points at the bytes this run
+            # loaded. On the configured-allowlist path EXPECTED_BASE_SHA is the
+            # release head (bound just above), so that proof is absent here;
+            # re-resolve the live default head and bind GITHUB_WORKFLOW_SHA to it,
+            # so a reviewer superseded after dispatch -- default advanced to
+            # revoke the allowlist entry or ship a fix -- is caught before pre,
+            # publish and final publication, not only once before evidence
+            # construction. The default path needs no fetch: its EXPECTED_BASE_SHA
+            # IS the reviewed default head and GITHUB_WORKFLOW_SHA == it is proven
+            # upstream.
+            if [ "$base_ref_admitted_via" = "configured-allowlist" ]; then
+              local live_default_head
+              live_default_head="$(bounded_gh \
+                "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${DEFAULT_BRANCH}" \
+                --jq '.object.sha')"
+              [[ "$live_default_head" =~ ^[0-9a-f]{40}$ ]]
+              test "$GITHUB_WORKFLOW_SHA" = "$live_default_head"
+            fi
             bounded_gh "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
               > "$run_file"
             # On pull_request_target the Actions API reports the PULL REQUEST's
