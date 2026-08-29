@@ -203,6 +203,22 @@ jobs:
           EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The base ref this pull request actually targets. Used ONLY to look
+          # itself up in the trusted allowlist below; it never widens admission
+          # on its own.
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # PER-REPO BASE-REF ALLOWLIST. One entry per line, "<owner/repo> <ref>".
+          # EMPTY in the canonical: the fleet-wide posture is default-branch-only
+          # and is UNCHANGED by this mechanism. An entry admits adversarial review
+          # of a specific NON-default base on a specific repo -- for a repo whose
+          # production genuinely deploys from a release branch, so the branch that
+          # reaches production can be reviewed. The list lives in this workflow on
+          # the protected default branch, and pull_request_target runs the
+          # DEFAULT-branch workflow, so a pull request can never edit its own
+          # eligibility. The admitted base's head is resolved authoritatively from
+          # the repository's git ref, never from the pull request payload.
+          REVIEWER_ALLOWLISTED_BASE_REFS: |
+            jbutler1980/pi-core release/pi-core-incomplete-work-closure-20260505
         run: |
           set -euo pipefail
           # Every gate in this step is fail-closed and stays fail-closed. What
@@ -321,6 +337,50 @@ jobs:
             || fail_source_assertion \
               "pr_number is not a positive decimal integer (pr_number_bytes=${#PR_NUMBER})"
 
+          # --- CONFIGURED NON-DEFAULT BASE ADMISSION -------------------------
+          # THE DEFAULT PATH IS UNCHANGED. Every binding above ran against
+          # EXPECTED_BASE_REF=default_branch and EXPECTED_BASE_SHA=workflow_sha,
+          # so the "this reviewer executes from the protected default branch"
+          # proof (the workflow_sha and workflow_ref tripwires) is intact for
+          # every path, including this one.
+          #
+          # If -- and ONLY if -- this pull request targets a NON-default base
+          # that the per-repo allowlist names for THIS repository, the reviewed
+          # base is re-pointed at that ref and its head is resolved
+          # AUTHORITATIVELY from the repository (gh api git/ref), never from any
+          # value the pull request payload carries. An arbitrary base an attacker
+          # might target is not in the list, is never re-pointed, and is refused
+          # exactly as before by the base-ref-is-expected conjunct in the
+          # authority below, because EXPECTED_BASE_REF stays the default branch
+          # for it while the pull request base does not.
+          base_ref_admitted_via=default-branch
+          if [ "$PR_BASE_REF" != "$EXPECTED_BASE_REF" ]; then
+            while IFS= read -r allowed_line; do
+              case "$allowed_line" in *" "*) ;; *) continue ;; esac
+              allowed_repo="${allowed_line%% *}"
+              allowed_ref="${allowed_line#* }"
+              [ "$allowed_repo" = "$GITHUB_REPOSITORY" ] || continue
+              [ "$allowed_ref" \
+                = "$(git check-ref-format --branch "$allowed_ref" 2>/dev/null || true)" ] \
+                || continue
+              [ "$allowed_ref" = "$PR_BASE_REF" ] || continue
+              base_ref_admitted_via=configured-allowlist
+              break
+            done <<< "${REVIEWER_ALLOWLISTED_BASE_REFS:-}"
+          fi
+          if [ "$base_ref_admitted_via" = "configured-allowlist" ]; then
+            EXPECTED_BASE_REF="$PR_BASE_REF"
+            EXPECTED_BASE_SHA="$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${EXPECTED_BASE_REF}" \
+              2>/dev/null --jq '.object.sha' || true)"
+            [[ "$EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+              || fail_source_assertion \
+                "configured base ref has no resolvable head object name; base_ref=${EXPECTED_BASE_REF} pr=${PR_NUMBER}" \
+                "source-base-unresolved" \
+                "pr=${PR_NUMBER}"
+          fi
+          # --- END CONFIGURED NON-DEFAULT BASE ADMISSION ---------------------
+
           input_dir="$RUNNER_TEMP/pr-review-input"
           install -d -m 0700 "$input_dir"
           repository="$input_dir/repository.git"
@@ -352,8 +412,9 @@ jobs:
                 clause("state-open"; .state == "open"),
                 clause("not-draft"; .draft == false),
                 clause("base-ref-is-expected"; $want_base_ref == .base.ref),
-                clause("base-ref-is-default-branch";
-                  .base.repo.default_branch == .base.ref),
+                clause("base-ref-is-admissible";
+                  .base.repo.default_branch == .base.ref
+                  or $base_ref_admitted == "configured-allowlist"),
                 clause("head-repository-is-this-repository";
                   $want_repository == .head.repo.full_name),
                 clause("head-sha-is-expected"; $want_head == .head.sha),
@@ -365,6 +426,7 @@ jobs:
               --arg want_base_ref "$EXPECTED_BASE_REF" \
               --arg want_head "$EXPECTED_HEAD_SHA" \
               --arg want_repository "$GITHUB_REPOSITORY" \
+              --arg base_ref_admitted "$base_ref_admitted_via" \
               "$1" 2>/dev/null || printf 'reporter-unavailable'
           }
           report_failed_protected_ref_clauses() {
@@ -467,11 +529,13 @@ jobs:
           jq -e \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg base_ref "$EXPECTED_BASE_REF" \
-            --arg head "$EXPECTED_HEAD_SHA" '
+            --arg head "$EXPECTED_HEAD_SHA" \
+            --arg base_ref_admitted "$base_ref_admitted_via" '
             .state == "open"
             and .draft == false
             and .base.ref == $base_ref
-            and .base.ref == .base.repo.default_branch
+            and ( .base.ref == .base.repo.default_branch
+                  or $base_ref_admitted == "configured-allowlist" )
             and .head.repo.full_name == $repository
             and .head.sha == $head
             and all(.labels[]; .name != "do-not-merge")
@@ -496,6 +560,17 @@ jobs:
           export GIT_CONFIG_COUNT=1
           export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${git_auth}"
+          # On the configured-allowlist path the reviewed base is a NON-default
+          # ref, but the reviewer that EXECUTED is still the default-branch copy
+          # (pull_request_target always runs the default-branch workflow). Fetch
+          # that default-branch commit too, so the recorded workflow_sha256
+          # hashes the bytes that ACTUALLY RAN -- not the possibly-older copy on
+          # the reviewed release branch -- and so a release branch that lacks the
+          # workflow file cannot abort the review. Empty on the default path, and
+          # attempt-invariant either way.
+          exec_base_refspec=""
+          [ "$base_ref_admitted_via" = "configured-allowlist" ] \
+            && exec_base_refspec="+${EXPECTED_WORKFLOW_SHA}:refs/review/exec-base"
           # Bounded retry for the NETWORK fetch only. Runner-side transient
           # transport failures ("fetch-pack: invalid index-pack output") have
           # been observed to persist across an immediate manual rerun, so the
@@ -572,7 +647,8 @@ jobs:
                   --no-recurse-submodules \
                   --filter=blob:limit=1048576 origin \
                   "+${EXPECTED_BASE_SHA}:refs/review/base" \
-                  "+refs/pull/${PR_NUMBER}/head:refs/review/head"
+                  "+refs/pull/${PR_NUMBER}/head:refs/review/head" \
+                  ${exec_base_refspec:+"$exec_base_refspec"}
             ) || fetch_status=$?
             if test "$fetch_status" -eq 0; then
               break
@@ -738,8 +814,17 @@ jobs:
           git -C "$repository" remote remove origin
           test -z "$(git -C "$repository" remote)"
 
+          # Materialize the reviewer workflow that ACTUALLY EXECUTED. On the
+          # default path that is the reviewed base (EXPECTED_BASE_SHA == the
+          # default-branch head); on the configured-allowlist path it is the
+          # separately-fetched default-branch commit (refs/review/exec-base), NOT
+          # the reviewed release base -- so workflow_sha256 records the bytes that
+          # ran and a release branch missing the file cannot abort the review.
+          workflow_source_ref="$EXPECTED_BASE_SHA"
+          [ "$base_ref_admitted_via" = "configured-allowlist" ] \
+            && workflow_source_ref="refs/review/exec-base"
           git -C "$repository" show \
-            "$EXPECTED_BASE_SHA:.github/workflows/claude-pr-review.yml" \
+            "${workflow_source_ref}:.github/workflows/claude-pr-review.yml" \
             > "$workflow_source"
           test -s "$workflow_source"
 
@@ -5451,6 +5536,9 @@ jobs:
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
           GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The repository default branch, used to tell the default-base path from
+          # a configured-allowlist path when re-deriving the execution proof below.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # --- LANE DISCRIMINATION -------------------------------------------
@@ -5506,12 +5594,35 @@ jobs:
           [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
           [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$GITHUB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # The reviewed base is trusted here: it is the review job's own output,
+          # produced by default-branch code, not a pull-request field. So "the
+          # reviewed base is the default branch" is a safe proxy for "admitted on
+          # the default path", and its negation for "admitted via the configured
+          # allowlist" -- the review job only ever emits a non-default reviewed
+          # base after its trusted allowlist check passed.
+          test "$DEFAULT_BRANCH" = "$(git check-ref-format --branch "$DEFAULT_BRANCH")"
+          base_ref_admitted_via=default-branch
+          [ "$EXPECTED_BASE_REF" = "$DEFAULT_BRANCH" ] \
+            || base_ref_admitted_via=configured-allowlist
           # EXECUTES-FROM-THE-PROTECTED-BASE. Asserted on BOTH lanes, because a
           # comment posted from a pull-request-controlled workflow file would be
           # forgeable evidence whatever verdict it carried.
+          #
+          # On the default-base path the reviewed base IS the default branch, so
+          # workflow_sha == base_sha is the proof and is asserted verbatim. On the
+          # configured-allowlist path the reviewed base is a non-default ref whose
+          # head is bound on the protected ref below (in validate_live_controls);
+          # the execution proof is then the workflow_ref naming the DEFAULT branch
+          # -- pull_request_target always runs the default branch's workflow file
+          # -- which holds on both paths and is what makes the comment unforgeable.
+          if [ "$base_ref_admitted_via" = "default-branch" ]; then
           test "$GITHUB_WORKFLOW_SHA" = "$EXPECTED_BASE_SHA"
           test "$GITHUB_WORKFLOW_REF" = \
             "${GITHUB_REPOSITORY}/.github/workflows/claude-pr-review.yml@refs/heads/${EXPECTED_BASE_REF}"
+          else
+          test "$GITHUB_WORKFLOW_REF" = \
+            "${GITHUB_REPOSITORY}/.github/workflows/claude-pr-review.yml@refs/heads/${DEFAULT_BRANCH}"
+          fi
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           if [ "$publish_verdict" = "PASS" ]; then
           [[ "$EXPECTED_CHUNK_COUNT" =~ ^[1-9][0-9]*$ ]]
@@ -5945,11 +6056,13 @@ jobs:
             jq -e \
               --arg repository "$GITHUB_REPOSITORY" \
               --arg base_ref "$EXPECTED_BASE_REF" \
-              --arg head "$EXPECTED_HEAD_SHA" '
+              --arg head "$EXPECTED_HEAD_SHA" \
+              --arg base_ref_admitted "$base_ref_admitted_via" '
               .state == "open"
               and .draft == false
               and .base.ref == $base_ref
-              and .base.ref == .base.repo.default_branch
+              and ( .base.ref == .base.repo.default_branch
+                    or $base_ref_admitted == "configured-allowlist" )
               and .head.repo.full_name == $repository
               and .head.sha == $head
               and all(.labels[]; .name != "do-not-merge")
