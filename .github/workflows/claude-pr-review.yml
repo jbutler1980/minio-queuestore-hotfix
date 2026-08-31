@@ -1001,9 +1001,23 @@ jobs:
           }, sort_keys=True))
           PY
 
+          # #212 P1: the two facts the END-OF-JOB liveness re-assert needs, and
+          # the only two it may not re-derive for itself. `default-branch` is
+          # the default branch as this step proved it -- well-formed by
+          # `git check-ref-format --branch`, inside the publication alphabet,
+          # and tied to the ref this workflow actually executed from by the
+          # workflow_ref tripwire -- captured BEFORE the admission block may
+          # repoint the reviewed base. `base-ref-admitted-via` is which path
+          # admitted, so the final re-assert can apply the allowlist-path
+          # binding without re-running admission (and without a second copy of
+          # the allowlist, which would be a second place to revoke an entry).
+          # Both are DIAGNOSTIC-to-the-job only: neither is a job output and
+          # neither reaches the publisher.
           {
             echo "base-ref=$EXPECTED_BASE_REF"
+            echo "base-ref-admitted-via=$base_ref_admitted_via"
             echo "base-sha=$EXPECTED_BASE_SHA"
+            echo "default-branch=$DEFAULT_BRANCH"
             echo "head-sha=$EXPECTED_HEAD_SHA"
             echo "merge-tree-sha=$merge_tree"
             echo "diff-file=$diff"
@@ -5304,6 +5318,37 @@ jobs:
                 echo "Adversarial review: the reviewer did NOT reach a verdict; the pull request is outside what this reviewer admits (stage=${stage})." >&2
                 echo "This is a reviewer/tooling boundary, NOT a finding about this change. Read the source step log above for the clause or the bound that rejected." >&2
                 ;;
+              # ===== #212 P2 SOURCE-STAGE CLASSIFICATION =====
+              # The stages the base-ref admission and the required-job liveness
+              # region record. Every one of them ALREADY existed, already exited
+              # non-zero and already named itself on the source step's diagnostic
+              # channel -- and every one of them then arrived here unmatched and
+              # was printed as "failed at an unclassified point", the sentence
+              # that names the MODEL step. That is the identical defect the
+              # chunk-phase arms above were written to close, in a newer place:
+              # the operator was pointed at the model for a class of failure
+              # that never reached a model.
+              #
+              # NOTHING HERE CHANGES A VERDICT. These arms only print. They fall
+              # through to the same `could-not-review` derivation (the case above
+              # maps every stage that is not `merit`/`injection` to it), publish
+              # nothing, and reach the same unconditional non-zero exit. A stage
+              # naming itself cannot make itself publishable: publication still
+              # requires `merit` or `injection` together with a structured
+              # `fail`, and no `source-` stage can produce either.
+              source-base-charset|source-default-charset)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; a branch name it must resolve is outside the publication branch-name alphabet (stage=${stage})." >&2
+                echo "This is a reviewer/tooling boundary, NOT a finding about this change. \`source-base-charset\` is the reviewed base ref, \`source-default-charset\` is the repository default branch. Admission and publication share ONE branch-name alphabet, so a name this reviewer could not publish about is refused before it is ever interpolated into a request rather than reviewed and then silently undeliverable." >&2
+                ;;
+              source-base-unresolved|source-default-head-unresolved)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; a branch head it resolves AUTHORITATIVELY did not resolve (stage=${stage})." >&2
+                echo "This is a reviewer/tooling failure, NOT a finding about this change. \`source-base-unresolved\` is the configured non-default base, \`source-default-head-unresolved\` is the repository default branch. Both are read from the repository's own git ref and never from the event payload, so a deleted or renamed branch -- or an API that did not answer -- fails closed here instead of falling back to a payload value that cannot be trusted." >&2
+                ;;
+              source-stale-reviewer)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; the default branch advanced while this run was in flight, so the bytes that ran are no longer canonical (stage=${stage})." >&2
+                echo "This is ordinary supersession, NOT a finding about this change: the default branch moved to revoke a base-ref allowlist entry or to ship a reviewer fix, and a superseded reviewer must not report a verdict. The next event on this pull request runs the current reviewer." >&2
+                ;;
+              # === END #212 P2 SOURCE-STAGE CLASSIFICATION ===
               kill-switch)
                 echo "Adversarial review: CANCELLED by the global kill switch (stage=${stage})." >&2
                 echo "The reviewer did NOT reach a verdict and did NOT call the model. This is the control working, NOT a finding about this change and NOT a model outage: do not investigate the model endpoint. The detail below says whether the switch read 'off' or could not be read at all -- an unreadable switch is treated as ENGAGED, which is the direction a kill switch has to fail." >&2
@@ -5574,6 +5619,145 @@ jobs:
             echo "reviewed-workflow-sha256=$EXPECTED_WORKFLOW_SHA256"
             echo "verdict=$STRUCTURED_VERDICT"
           } >> "$GITHUB_OUTPUT"
+
+      # ===== #212 P1 END-OF-JOB DEFAULT-HEAD LIVENESS RE-ASSERT =====
+      #
+      # #210 put the default-head liveness assertion inside the REQUIRED job --
+      # but only at the START of the "Materialize" step, which is the first
+      # thing the job does. Nothing later in `claude-review` re-resolved the
+      # default branch, so the required gate's proof that this reviewer is still
+      # the canonical one was as old as the run: minutes of model calls, chunk
+      # synthesis and manifest verification stood between the check and the
+      # green it certified. Advancing the default branch DURING that window --
+      # to revoke a base-ref allowlist entry, or to ship a reviewer fix -- left
+      # the required check reporting a pass from a reviewer that had already
+      # been superseded. The advisory publisher re-validated at publish; the
+      # REQUIRED job, which is the thing rulesets actually gate merges on, did
+      # not.
+      #
+      # This step is the last thing the job does, so a pass reported by
+      # `claude-review` is now bounded by a liveness proof taken at the moment it
+      # is reported rather than at the moment it started. It is a SEPARATE step
+      # rather than a tail on the verdict step for one reason: it must be the
+      # last executable thing in the job, and a tail is only the last thing until
+      # somebody appends to that step.
+      #
+      # NO `if:`. The step runs exactly when every preceding step succeeded --
+      # that is, on precisely the runs that are about to report success -- and is
+      # skipped on runs that are already red, which need no second red. It
+      # therefore cannot make the job run LESS, and it cannot launder a failure
+      # into a pass.
+      #
+      # WHAT IT CANNOT DO, STATED PLAINLY: it runs after the verdict step has
+      # already written `verdict=pass` to the step output, and it cannot unwrite
+      # that. It does not need to. The publisher's PASS lane requires the JOB
+      # RESULT to be success as well as the verdict, so a red step here skips
+      # publication outright; and every merge gate in the fleet is the
+      # `claude-review` CHECK, which is the job's own conclusion, not a step
+      # output nothing outside this file can read. The output is a leftover of a
+      # job that failed, and no path treats it as authority.
+      #
+      # ASYMMETRIC BY DESIGN, and this is the whole of the risk analysis:
+      #
+      #   configured-allowlist path -- the live default head MUST still equal the
+      #   workflow_sha this reviewer loaded from, fail-closed, exactly as the
+      #   start-of-job assertion demands. This path is opt-in per repo and ref
+      #   (empty in the canonical, self-scoped to one pi-core release branch
+      #   today), so the population that can be made red by a mid-run default
+      #   advance is small, named, and precisely the population whose reviewed
+      #   base is NOT the default branch and therefore has no other liveness
+      #   proof at all.
+      #
+      #   default path -- resolve the default head and re-apply the branch-name
+      #   charset gate, and DO NOT bind the head to workflow_sha. On this path
+      #   the reviewed base IS the default branch, and a merge to the default
+      #   branch during a review is not a defect, it is Tuesday. Binding here
+      #   would turn "somebody merged while your review ran" into a red REQUIRED
+      #   check on every repo in the fleet: a new control that blocks the
+      #   legitimate path, which is the same defect wearing the opposite coat.
+      #   The parity that IS kept is the cheap half -- the branch still resolves,
+      #   and its name is still one this reviewer could publish about.
+      #
+      # SAME ALPHABET AND ENCODING CONTRACT AS THE #210 REGION. The name is
+      # gated on the publication alphabet before use and percent-encoded outside
+      # it before it reaches a URL path (a proven identity for every name the
+      # gate admits, so it defends a future widening rather than today's refs).
+      # The head is resolved AUTHORITATIVELY from the repository's git ref --
+      # never from the event payload, which is frozen and cannot express
+      # liveness by construction.
+      #
+      # BOUNDED. Unlike the start-of-job copy this call runs after the model
+      # spend, where an unanswered request would park a paid runner until the
+      # job timeout; the request is wall-clock bounded and a bound that fires
+      # yields no object name, which fails closed.
+      - name: Re-assert default-head liveness before reporting success
+        env:
+          # Both come from the source step, which already proved them: the
+          # branch name passed `git check-ref-format --branch`, passed the
+          # publication-alphabet gate, and was tied to the ref this workflow
+          # executed from by the workflow_ref tripwire. Re-deriving either from
+          # the event payload here would re-admit exactly the untrusted channel
+          # the source step spent that proof to close.
+          BASE_REF_ADMITTED_VIA: ${{ steps.source.outputs.base-ref-admitted-via }}
+          DEFAULT_BRANCH: ${{ steps.source.outputs.default-branch }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          fail_final_liveness() {
+            printf 'Adversarial review failed final liveness assertion: %s\n' \
+              "$1" >&2
+            exit 1
+          }
+          # The #210 encoder, verbatim in behaviour: every byte outside the
+          # publication alphabet becomes %XX while the path-structural '/' is
+          # preserved, so a release ref is never rewritten.
+          url_encode_ref() {
+            local raw="$1" out="" i char
+            for (( i = 0; i < ${#raw}; i++ )); do
+              char="${raw:i:1}"
+              case "$char" in
+                [A-Za-z0-9._/-]) out+="$char" ;;
+                *) printf -v char '%%%02X' "'$char"; out+="$char" ;;
+              esac
+            done
+            printf '%s' "$out"
+          }
+          # An UNRECOGNISED admission path is a failure, not a default. If the
+          # source step ever stops recording which path admitted, the safe
+          # reading is not "assume the unbound one".
+          case "$BASE_REF_ADMITTED_VIA" in
+            default-branch | configured-allowlist) ;;
+            *)
+              fail_final_liveness \
+                "the source step recorded no admission path, so the correct end-of-job binding cannot be chosen; pr=${PR_NUMBER}"
+              ;;
+          esac
+          [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9._/-]{1,512}$ ]] \
+            || fail_final_liveness \
+              "default branch is outside the publication alphabet; default_branch_bytes=${#DEFAULT_BRANCH} pr=${PR_NUMBER}"
+          [[ "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || fail_final_liveness \
+              "workflow_sha is not a 40-hex object name; workflow_sha_bytes=${#EXPECTED_WORKFLOW_SHA} pr=${PR_NUMBER}"
+          encoded_final_default_branch="$(url_encode_ref "$DEFAULT_BRANCH")"
+          final_default_head="$(timeout --kill-after=5s 20s gh api \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${encoded_final_default_branch}" \
+            2>/dev/null --jq '.object.sha' || true)"
+          [[ "$final_default_head" =~ ^[0-9a-f]{40}$ ]] \
+            || fail_final_liveness \
+              "the live default head did not resolve at the end of the required job; default_branch=${DEFAULT_BRANCH} pr=${PR_NUMBER}"
+          if [ "$BASE_REF_ADMITTED_VIA" = "configured-allowlist" ]; then
+            test "$EXPECTED_WORKFLOW_SHA" = "$final_default_head" \
+              || fail_final_liveness \
+                "stale_reviewer_at_exit: the default branch advanced while this run was in flight; the reviewer that produced this verdict is no longer canonical. workflow_sha=${EXPECTED_WORKFLOW_SHA} final_default_head=${final_default_head} default_branch=${DEFAULT_BRANCH} pr=${PR_NUMBER}"
+          fi
+          # One line, in the same shape as the outcome line, so an operator can
+          # read off a passing run WHICH liveness contract it satisfied rather
+          # than inferring it from the absence of a failure.
+          printf 'final-default-head-liveness: ok admitted_via=%s default_branch=%s final_default_head=%s\n' \
+            "$BASE_REF_ADMITTED_VIA" "$DEFAULT_BRANCH" "$final_default_head" >&2
+      # === END #212 P1 END-OF-JOB DEFAULT-HEAD LIVENESS RE-ASSERT ===
 
   publish-review-evidence:
     name: publish-review-evidence
