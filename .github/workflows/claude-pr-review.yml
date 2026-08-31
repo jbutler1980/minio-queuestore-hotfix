@@ -302,6 +302,24 @@ jobs:
             printf 'Adversarial review failed source assertion: %s\n' "$1" >&2
             exit 1
           }
+          # #210 P3: percent-encode a branch ref for interpolation into a `gh api`
+          # URL path, encoding every byte OUTSIDE the publication alphabet
+          # (^[A-Za-z0-9._/-]$) while preserving the path-structural '/'. On any
+          # ref that has passed the publication-alphabet gate this is a proven
+          # IDENTITY -- it never rewrites the '/' in a release ref -- so it defends
+          # only a future alphabet widening while making "encode before gh api"
+          # explicit on the default path, at parity with the allowlist path.
+          url_encode_ref() {
+            local raw="$1" out="" i char
+            for (( i = 0; i < ${#raw}; i++ )); do
+              char="${raw:i:1}"
+              case "$char" in
+                [A-Za-z0-9._/-]) out+="$char" ;;
+                *) printf -v char '%%%02X' "'$char"; out+="$char" ;;
+              esac
+            done
+            printf '%s' "$out"
+          }
           test "$EXPECTED_BASE_REF" = "$(git check-ref-format --branch "$EXPECTED_BASE_REF")" \
             || fail_source_assertion \
               "base_ref is not a well-formed branch name (base_ref_bytes=${#EXPECTED_BASE_REF})"
@@ -336,6 +354,14 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] \
             || fail_source_assertion \
               "pr_number is not a positive decimal integer (pr_number_bytes=${#PR_NUMBER})"
+
+          # #210 P1: capture the default branch BEFORE the admission block below
+          # may repoint EXPECTED_BASE_REF at a non-default allowlisted ref. The
+          # default branch is still needed for the required-job default-head
+          # liveness assertion regardless of which path admits, and here -- before
+          # admission -- EXPECTED_BASE_REF is exactly the default branch, already
+          # proven well-formed by the check-ref-format gate above.
+          DEFAULT_BRANCH="$EXPECTED_BASE_REF"
 
           # --- CONFIGURED NON-DEFAULT BASE ADMISSION -------------------------
           # THE DEFAULT PATH IS UNCHANGED. Every binding above ran against
@@ -391,6 +417,67 @@ jobs:
                 "pr=${PR_NUMBER}"
           fi
           # --- END CONFIGURED NON-DEFAULT BASE ADMISSION ---------------------
+
+          # ===== #210 REQUIRED-JOB DEFAULT-HEAD LIVENESS + DEFAULT-PATH CHARSET =====
+          # Two hardenings previously enforced ONLY in the advisory
+          # publish-review-evidence job, moved into the REQUIRED claude-review job
+          # so the required gate itself goes red -- not just the advisory publisher
+          # -- on drift or a malformed default branch.
+          #
+          # (P3) DEFAULT-PATH BRANCH-NAME CHARSET + ENCODE PARITY. The
+          # configured-allowlist path already gates its ref on the publication
+          # alphabet (^[A-Za-z0-9._/-]{1,512}$) before `gh api`; the default path
+          # only ran `git check-ref-format --branch`, a WIDER alphabet, then
+          # interpolated the default branch straight into the protected-ref URL.
+          # Gate EXPECTED_BASE_REF (the reviewed base -- the default branch on the
+          # default path) and DEFAULT_BRANCH on the SAME alphabet and URL-encode
+          # them before `gh api`. A no-op re-check for the already-gated allowlist
+          # ref; a real gate for the default branch. Fail-closed.
+          [[ "$EXPECTED_BASE_REF" =~ ^[A-Za-z0-9._/-]{1,512}$ ]] \
+            || fail_source_assertion \
+              "reviewed base ref is outside the publication alphabet; base_ref_bytes=${#EXPECTED_BASE_REF} pr=${PR_NUMBER}" \
+              "source-base-charset" \
+              "pr=${PR_NUMBER}"
+          [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9._/-]{1,512}$ ]] \
+            || fail_source_assertion \
+              "default branch is outside the publication alphabet; default_branch_bytes=${#DEFAULT_BRANCH} pr=${PR_NUMBER}" \
+              "source-default-charset" \
+              "pr=${PR_NUMBER}"
+          encoded_base_ref="$(url_encode_ref "$EXPECTED_BASE_REF")"
+          encoded_default_branch="$(url_encode_ref "$DEFAULT_BRANCH")"
+
+          # (P1) DEFAULT-BRANCH LIVENESS IN THE REQUIRED JOB. On the default path
+          # the reviewed base IS the default branch and the protected-ref
+          # revalidation below already proves the live default head still equals
+          # the workflow_sha this reviewer loaded from. On the configured-allowlist
+          # path EXPECTED_BASE_SHA is the RELEASE head, so that proof is ABSENT
+          # here: workflow_ref naming the default branch shows WHICH ref ran, not
+          # that the default branch still points at the bytes this run loaded.
+          # Until #210 this default-head liveness lived ONLY in the advisory
+          # publish-review-evidence job, so a repo that required claude-review but
+          # not publish-review-evidence AND had a firing allowlist entry could keep
+          # the REQUIRED gate green while the default head drifted (reviewer
+          # superseded after dispatch -- default advanced to revoke the allowlist
+          # entry or ship a reviewer fix). Resolve the live default head
+          # AUTHORITATIVELY (gh api git/ref -- never a payload field) and assert it
+          # still equals EXPECTED_WORKFLOW_SHA, fail-closed. The advisory publisher
+          # keeps its own copy (defense in depth).
+          if [ "$base_ref_admitted_via" = "configured-allowlist" ]; then
+            live_default_head="$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${encoded_default_branch}" \
+              2>/dev/null --jq '.object.sha' || true)"
+            [[ "$live_default_head" =~ ^[0-9a-f]{40}$ ]] \
+              || fail_source_assertion \
+                "configured-allowlist run could not resolve the live default head; default_branch=${DEFAULT_BRANCH} pr=${PR_NUMBER}" \
+                "source-default-head-unresolved" \
+                "pr=${PR_NUMBER}"
+            test "$EXPECTED_WORKFLOW_SHA" = "$live_default_head" \
+              || fail_source_assertion \
+                "stale_reviewer: the default branch advanced after this run was dispatched; the reviewer that ran is no longer canonical. workflow_sha=${EXPECTED_WORKFLOW_SHA} live_default_head=${live_default_head} default_branch=${DEFAULT_BRANCH} pr=${PR_NUMBER}" \
+                "source-stale-reviewer" \
+                "pr=${PR_NUMBER}"
+          fi
+          # === END #210 REQUIRED-JOB DEFAULT-HEAD LIVENESS + DEFAULT-PATH CHARSET ===
 
           input_dir="$RUNNER_TEMP/pr-review-input"
           install -d -m 0700 "$input_dir"
@@ -553,7 +640,10 @@ jobs:
           ' "$pr" >/dev/null \
             || reject_live_pull_request \
               "$(report_failed_pull_request_clauses "$pr")" "$(wc -c < "$pr")"
-          gh api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${EXPECTED_BASE_REF}" \
+          # #210 P3: interpolate the URL-encoded, publication-alphabet-gated ref
+          # (encoded_base_ref == EXPECTED_BASE_REF for any ref that passed the
+          # gate above, on BOTH paths), never the raw branch name.
+          gh api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${encoded_base_ref}" \
             > "$protected_ref"
           jq -e \
             --arg ref "refs/heads/${EXPECTED_BASE_REF}" \
@@ -6123,11 +6213,19 @@ jobs:
             # upstream.
             if [ "$base_ref_admitted_via" = "configured-allowlist" ]; then
               local live_default_head
+              # #210 P2: validate_live_controls runs at `final` inside a condition
+              # context (`if ... && ...` / `|| status=$?`), which suppresses
+              # `set -e` for this WHOLE function body -- so a bare failing
+              # default-head `test` here could not abort, and the later run-object
+              # and kill-switch checks' success would MASK it. Make every leg of
+              # the default-head liveness `|| return 1` so the mismatch propagates
+              # as a non-zero function result at pre, publish AND final, regardless
+              # of the caller's context.
               live_default_head="$(bounded_gh \
                 "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${DEFAULT_BRANCH}" \
-                --jq '.object.sha')"
-              [[ "$live_default_head" =~ ^[0-9a-f]{40}$ ]]
-              test "$GITHUB_WORKFLOW_SHA" = "$live_default_head"
+                --jq '.object.sha')" || return 1
+              [[ "$live_default_head" =~ ^[0-9a-f]{40}$ ]] || return 1
+              test "$GITHUB_WORKFLOW_SHA" = "$live_default_head" || return 1
             fi
             bounded_gh "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
               > "$run_file"
@@ -6232,7 +6330,17 @@ jobs:
           fi
 
           final_comment="$RUNNER_TEMP/final-comment.json"
-          if validate_live_controls final \
+          # #210 P2: run the final liveness revalidation as its OWN statement and
+          # capture its status, instead of burying it at the head of an
+          # `if ... && ...` chain. Even with the `|| return 1` legs inside
+          # validate_live_controls, keeping the result in a named status makes the
+          # propagation explicit: a non-zero `final` liveness result now visibly
+          # forces the post-write compensation path below (restore the pending
+          # marker, or delete the PASS evidence) rather than being swallowed by the
+          # condition context that suppresses set -e for the function body.
+          final_liveness_status=0
+          validate_live_controls final || final_liveness_status=$?
+          if [ "$final_liveness_status" -eq 0 ] \
             && fetch_comment "$final_comment" \
             && validate_comment "$final_comment" "$pass_body"; then
             exit 0
