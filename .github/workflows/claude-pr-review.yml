@@ -1808,6 +1808,9 @@ jobs:
           call_models() {
             local request="$1"
             local response="$2"
+            # A failed optional confirmation cannot erase an authenticated
+            # first-sample merit fail. Access denial remains globally named.
+            local non_authoritative_confirmation="${3:-0}"
             local headers="${response}.headers"
             local wire_request="${response}.wire-request"
             local raw_response="${response}.raw"
@@ -1842,7 +1845,9 @@ jobs:
             fi
             for attempt in 1 2; do
               if [ "$(( $(date +%s) + 975 ))" -ge "$REVIEW_DEADLINE_EPOCH" ]; then
-                record_failure_stage "review-time-budget"
+                if [ "$non_authoritative_confirmation" != "1" ]; then
+                  record_failure_stage "review-time-budget"
+                fi
                 echo "Review time budget exhausted before the next model call." >&2
                 return 1
               fi
@@ -1925,10 +1930,14 @@ jobs:
                 else
                   parser_status=$?
                   if [ "$parser_status" -eq 2 ]; then
-                    record_failure_stage "model-output-incomplete"
+                    if [ "$non_authoritative_confirmation" != "1" ]; then
+                      record_failure_stage "model-output-incomplete"
+                    fi
                     echo "OpenAI response exhausted its output budget without a completed verdict." >&2
                   else
-                    record_failure_stage "model-response-shape"
+                    if [ "$non_authoritative_confirmation" != "1" ]; then
+                      record_failure_stage "model-response-shape"
+                    fi
                     echo "OpenAI response lacked exactly one completed final assistant message." >&2
                   fi
                   return 1
@@ -2546,7 +2555,7 @@ jobs:
                 | type == "number"
                 and floor == .
                 and . >= 1
-                and . <= 8000
+                and . <= 80000
               )
               and (
                 .usage.completion_tokens
@@ -2868,7 +2877,7 @@ jobs:
                 clause("assistant-role"; .choices[0].message.role == "assistant"),
                 clause("prompt-token-bounds";
                   .usage.prompt_tokens
-                  | type == "number" and floor == . and . >= 1 and . <= 8000),
+                  | type == "number" and floor == . and . >= 1 and . <= 80000),
                 clause("completion-token-bounds";
                   .usage.completion_tokens
                   | type == "number" and floor == . and . >= 1 and . <= $cap),
@@ -5006,7 +5015,7 @@ jobs:
             build_synthesis_request "$synthesis_confirm_nonce" 20260730 \
               "$synthesis_confirm_header" "$synthesis_confirm_request"
             if synthesis_confirm_status="$(
-              call_models "$synthesis_confirm_request" "$synthesis_confirm_response"
+              call_models "$synthesis_confirm_request" "$synthesis_confirm_response" 1
             )" \
               && [ "$synthesis_confirm_status" = "200" ] \
               && validate_synthesis_response "$synthesis_confirm_response" \
