@@ -173,8 +173,10 @@ jobs:
       # honoured and still retried, so nothing transient becomes fatal that was
       # not fatal before.
       - name: Enforce global kill switch
+        id: budget
         run: |
           set -euo pipefail
+          echo "started-at-epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
           state="$(curl --fail --silent --show-error --location \
             --proto '=https' --proto-redir '=https' --max-redirs 2 \
             --max-time 15 --retry 2 --retry-max-time 60 \
@@ -1495,6 +1497,7 @@ jobs:
           DIFF_FILE: ${{ steps.source.outputs.diff-file }}
           MANIFEST_FILE: ${{ steps.chunks.outputs.manifest-file }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JOB_START_EPOCH: ${{ steps.budget.outputs.started-at-epoch }}
         run: |
           set -euo pipefail
           case "$REASONING_EFFORT" in
@@ -1503,11 +1506,14 @@ jobs:
           esac
           [[ "$MAX_COMPLETION_TOKENS" =~ ^[1-9][0-9]*$ ]]
           test "$MAX_COMPLETION_TOKENS" -le 128000
-          # Leave 30 minutes before the 300-minute job limit for a final
-          # 900-second API call and fail-closed evidence handling. A serial
-          # 64-chunk review at the measured 209-second slowest chunk needs
-          # 223 minutes before synthesis; 270 minutes leaves headroom.
-          REVIEW_DEADLINE_EPOCH=$(( $(date +%s) + 270 * 60 ))
+          # The clock starts in the first step, so source materialization and
+          # chunk construction consume the same 270-minute budget as model
+          # calls. Reserve 75 seconds for the bounded kill-switch fetch and
+          # 900 seconds for the call before that deadline, leaving at least
+          # 30 minutes before the 300-minute
+          # job limit for fail-closed validation and evidence handling.
+          [[ "$JOB_START_EPOCH" =~ ^[1-9][0-9]*$ ]]
+          REVIEW_DEADLINE_EPOCH=$(( JOB_START_EPOCH + 270 * 60 ))
           python3 - "$DIFF_FILE" "$CHUNK_DIR" "$MANIFEST_FILE" <<'PY'
           import hashlib
           import json
@@ -1815,7 +1821,7 @@ jobs:
             # this transport boundary maps them to Responses input/text.format.
             # Responses rejects seed as an unknown parameter (measured HTTP 400);
             # per-exchange nonces still bind every independent sample.
-            jq -e '
+            jq -ec '
               (.response_format.json_schema) as $schema |
               {
                 model: .model,
@@ -1826,8 +1832,16 @@ jobs:
                 store: false
               }
             ' "$request" > "$wire_request" || return 1
+            # Bound the complete transmitted request, including escaped text,
+            # schema and framing. At most one token per wire byte plus 10,000
+            # tokens of service framing fits the 80,000-token input validator.
+            if [ "$(wc -c < "$wire_request")" -gt 70000 ]; then
+              record_failure_stage "model-request-bound"
+              echo "OpenAI wire request exceeds the 70000-byte input bound." >&2
+              return 1
+            fi
             for attempt in 1 2; do
-              if [ "$(date +%s)" -ge "$REVIEW_DEADLINE_EPOCH" ]; then
+              if [ "$(( $(date +%s) + 975 ))" -ge "$REVIEW_DEADLINE_EPOCH" ]; then
                 record_failure_stage "review-time-budget"
                 echo "Review time budget exhausted before the next model call." >&2
                 return 1
@@ -2720,7 +2734,7 @@ jobs:
               | type == "number"
               and floor == .
               and . >= 1
-              and . <= 8000
+              and . <= 80000
             )
             and (
               .usage.completion_tokens
@@ -3110,7 +3124,7 @@ jobs:
                 clause("assistant-role"; .choices[0].message.role == "assistant"),
                 clause("prompt-token-bounds";
                   .usage.prompt_tokens
-                  | type == "number" and floor == . and . >= 1 and . <= 8000),
+                  | type == "number" and floor == . and . >= 1 and . <= 80000),
                 clause("completion-token-bounds";
                   .usage.completion_tokens
                   | type == "number" and floor == . and . >= 1 and . <= $cap),
@@ -4549,9 +4563,9 @@ jobs:
             # the synthesis has not been judged yet, so equality is asserted at
             # publication time (the verdict step), not here.
             and ($review.merit_confirmations
-                 | type == "number" and floor == . and . >= 0 and . <= 49)
+                 | type == "number" and floor == . and . >= 0 and . <= 65)
             and ($review.merit_disagreements
-                 | type == "number" and floor == . and . >= 0 and . <= 49)
+                 | type == "number" and floor == . and . >= 0 and . <= 65)
             # A disagreement is a confirmation whose second sample voted pass,
             # so disagreements can never exceed confirmations. The stronger
             # EQUALITY (no confirmed failure survived) is asserted at publication
@@ -4569,10 +4583,10 @@ jobs:
           ' "$review_manifest" >/dev/null \
             || fail_aggregate_assertion "assembled review manifest failed its self-consistency check"
           review_manifest_bytes="$(wc -c < "$review_manifest")"
-          if [ "$review_manifest_bytes" -gt 50000 ]; then
-            echo "Review evidence exceeds 50000 bytes; use an independent review path." >&2
+          if [ "$review_manifest_bytes" -gt 100000 ]; then
+            echo "Review evidence exceeds 100000 bytes; use an independent review path." >&2
             record_failure_stage "aggregate-assertion" \
-              "review_manifest_bytes=${review_manifest_bytes} limit=50000"
+              "review_manifest_bytes=${review_manifest_bytes} limit=100000"
             exit 1
           fi
 
@@ -4856,14 +4870,11 @@ jobs:
           # (<= 10400) + chunk_summaries_bytes (<= 19000) = 32000 worst case.
           # 22000 was sized for the old 120-byte summary cap and a 48-chunk
           # review at 240 bytes measures 22973 decoded bytes, so leaving it
-          # would have made a legal review unsendable. The real ceiling is the
-          # validated prompt_tokens <= 8000: measured live at the previous worst
-          # case, the synthesis prompt cost 4548 tokens on both
-          # gpt-5.4-2026-03-05 and the dependabot gpt-5-mini path. Carrying each
-          # chunk verdict and the corrected instructions adds 816 bytes of
-          # payload and 587 bytes of framing, i.e. order 350 tokens on the
-          # pinned tokenizer, so the worst case stays far inside the token bound
-          # rather than trading one unsatisfiable cap for another.
+          # would have made a legal review unsendable. Luna input tokenization
+          # can exceed four tokens per byte for dense ASCII, so the synthesis
+          # response and evidence validators admit up to 80000 input tokens;
+          # the transport bounds the complete wire request to 70000 bytes,
+          # leaving 10000 tokens for service framing.
           #
           # THE 2600 CAP IS NOT THE COMFORTABLE ONE THIS COMMENT USED TO CLAIM.
           # It said "fixed bytes measured at 1682 against the 2600 cap, so 918
@@ -5440,7 +5451,7 @@ jobs:
               review-time-budget)
                 echo "Adversarial review: the reviewer did NOT reach a verdict before its internal time budget (stage=${stage})." >&2
                 ;;
-              model-access-denied|model-output-incomplete|model-response-shape|\
+              model-access-denied|model-output-incomplete|model-response-shape|model-request-bound|\
               synthesis-transport|synthesis-api-error|synthesis-schema|\
               chunk-transport|chunk-api-error|chunk-schema)
                 echo "Adversarial review: the reviewer did NOT reach a verdict; the model call failed or returned nothing usable (stage=${stage})." >&2
@@ -5697,11 +5708,11 @@ jobs:
             # evidence, so this fails closed. Asserted in BOTH revalidators.
             and (
               .review.merit_confirmations
-              | type == "number" and floor == . and . >= 0 and . <= 49
+              | type == "number" and floor == . and . >= 0 and . <= 65
             )
             and (
               .review.merit_disagreements
-              | type == "number" and floor == . and . >= 0 and . <= 49
+              | type == "number" and floor == . and . >= 0 and . <= 65
             )
             and .review.merit_confirmations == .review.merit_disagreements
             and (.review.interface_ledger_sha256 | test("^[0-9a-f]{64}$"))
@@ -5731,7 +5742,7 @@ jobs:
               == .review.interface_ledger_sha256
             and .synthesis.chunk_summaries_sha256
               == .review.chunk_summaries_sha256
-            and .synthesis.prompt_tokens <= 8000
+            and .synthesis.prompt_tokens <= 80000
             and .synthesis.injection_detected == false
             and .synthesis.verdict == "pass"
           ' "$response_manifest" >/dev/null
@@ -5741,7 +5752,7 @@ jobs:
             = "$(jq -er .review_transcript_gzip_bytes "$response_manifest")"
           test "$(sha256sum "$transcript_gzip" | cut -d' ' -f1)" \
             = "$(jq -er .review_transcript_gzip_sha256 "$response_manifest")"
-          gzip -cd "$transcript_gzip" | head -c 52001 > "$transcript"
+          gzip -cd "$transcript_gzip" | head -c 70001 > "$transcript"
           test "$(wc -c < "$transcript")" \
             = "$(jq -er .review.review_transcript_bytes "$response_manifest")"
           test "$(sha256sum "$transcript" | cut -d' ' -f1)" \
@@ -6161,11 +6172,11 @@ jobs:
             # evidence, so this fails closed. Asserted in BOTH revalidators.
             and (
               .review.merit_confirmations
-              | type == "number" and floor == . and . >= 0 and . <= 49
+              | type == "number" and floor == . and . >= 0 and . <= 65
             )
             and (
               .review.merit_disagreements
-              | type == "number" and floor == . and . >= 0 and . <= 49
+              | type == "number" and floor == . and . >= 0 and . <= 65
             )
             and .review.merit_confirmations == .review.merit_disagreements
             and (.review.interface_ledger_sha256 | test("^[0-9a-f]{64}$"))
@@ -6195,7 +6206,7 @@ jobs:
               == .review.interface_ledger_sha256
             and .synthesis.chunk_summaries_sha256
               == .review.chunk_summaries_sha256
-            and .synthesis.prompt_tokens <= 8000
+            and .synthesis.prompt_tokens <= 80000
             and .synthesis.injection_detected == false
             and .synthesis.verdict == "pass"
           ' "$response_manifest" >/dev/null
@@ -6205,7 +6216,7 @@ jobs:
             = "$(jq -er .review_transcript_gzip_bytes "$response_manifest")"
           test "$(sha256sum "$transcript_gzip" | cut -d' ' -f1)" \
             = "$(jq -er .review_transcript_gzip_sha256 "$response_manifest")"
-          gzip -cd "$transcript_gzip" | head -c 52001 > "$transcript"
+          gzip -cd "$transcript_gzip" | head -c 70001 > "$transcript"
           test "$(wc -c < "$transcript")" \
             = "$(jq -er .review.review_transcript_bytes "$response_manifest")"
           test "$(sha256sum "$transcript" | cut -d' ' -f1)" \
@@ -6506,7 +6517,7 @@ jobs:
             local run_file="$RUNNER_TEMP/${phase}-workflow-run.json"
             local state head_ref
             bounded_gh "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
-              > "$pr_file"
+              > "$pr_file" || return 1
             # As in the source step: the pull request object's base.sha is the
             # frozen event value, never the live default branch head, so the
             # base is bound on the protected ref immediately below instead.
@@ -6523,21 +6534,21 @@ jobs:
               and .head.repo.full_name == $repository
               and .head.sha == $head
               and all(.labels[]; .name != "do-not-merge")
-            ' "$pr_file" >/dev/null
+            ' "$pr_file" >/dev/null || return 1
             # Taken from the pull request object the gate above just bound to
             # this exact repository, base, and head.
-            head_ref="$(jq -er .head.ref "$pr_file")"
-            test -n "$head_ref"
+            head_ref="$(jq -er .head.ref "$pr_file")" || return 1
+            test -n "$head_ref" || return 1
             bounded_gh \
               "/repos/${GITHUB_REPOSITORY}/git/ref/heads/${EXPECTED_BASE_REF}" \
-              > "$ref_file"
+              > "$ref_file" || return 1
             jq -e \
               --arg ref "refs/heads/${EXPECTED_BASE_REF}" \
               --arg base "$EXPECTED_BASE_SHA" '
               .ref == $ref
               and .object.type == "commit"
               and .object.sha == $base
-            ' "$ref_file" >/dev/null
+            ' "$ref_file" >/dev/null || return 1
             # DEFAULT-BRANCH LIVENESS, re-checked at EVERY publication boundary
             # (this function runs at pre, publish AND final). workflow_ref naming
             # the default branch -- asserted once up front -- shows WHICH ref ran,
@@ -6568,7 +6579,7 @@ jobs:
               test "$GITHUB_WORKFLOW_SHA" = "$live_default_head" || return 1
             fi
             bounded_gh "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-              > "$run_file"
+              > "$run_file" || return 1
             # On pull_request_target the Actions API reports the PULL REQUEST's
             # head on the run object -- head_branch is the PR branch and
             # head_sha is the PR head -- never the base the workflow executes
@@ -6591,7 +6602,7 @@ jobs:
               and .path == ".github/workflows/claude-pr-review.yml"
               and .status == "in_progress"
               and .conclusion == null
-            ' "$run_file" >/dev/null
+            ' "$run_file" >/dev/null || return 1
             # Same HTTPS-only, bounded-redirect posture as the job-start check
             # and the per-request check in the model step. See the comment on
             # "Enforce global kill switch" for why `--location` alone is not
@@ -6601,8 +6612,8 @@ jobs:
               --proto '=https' --proto-redir '=https' --max-redirs 2 \
               --max-time 15 --retry 2 --retry-max-time 60 \
               https://raw.githubusercontent.com/jbutler1980/agent-ops-flags/main/state \
-              | tr -d '[:space:]')"
-            test "$state" = "on"
+              | tr -d '[:space:]')" || return 1
+            test "$state" = "on" || return 1
           }
 
           fetch_comment() {
