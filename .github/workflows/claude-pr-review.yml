@@ -26,10 +26,10 @@ name: Adversarial PR Review
 # against it. Dropping the trigger to stop the spend removed the only
 # base-change signal with it.
 #
-# So the trigger stays and the JOB is guarded instead: an `edited` event runs
-# ONLY when the payload carries `changes.base`, which GitHub sets on exactly
-# that edit. A title or body edit skips before a runner is allocated, so it
-# costs nothing and cannot be replayed; a base change is reviewed.
+# The trigger stays and the JOB is guarded instead: an `edited` event runs
+# only for a base change, while a label event runs only for `do-not-merge`.
+# Title/body edits and unrelated labels skip before a runner is allocated; base
+# and control-label changes are reviewed.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
@@ -48,19 +48,16 @@ permissions: {}
 # about (ci-loop-sandbox pull 7, 2026-08-24): with a plain PR-number group the
 # in-flight run ends `cancelled` and its replacement ends `skipped`.
 #
-# So the GROUP now depends on whether this event will do any work. An `edited`
-# without `changes.base` -- exactly the set the job guard skips -- is given a
-# DIFFERENT group, where it can only ever cancel other no-op runs. Everything
-# else keeps the single per-pull-request group, so a new push still supersedes
-# the review it obsoletes, which is what `cancel-in-progress` is FOR. Same
-# measurement, same pull request: with this group the in-flight run survives
-# the title edit and is still cancelled by the next `synchronize`.
+# The GROUP now depends on whether this event will do any work. A metadata
+# edit without `changes.base` or an unrelated label transition gets a DIFFERENT
+# group, where it can only cancel other no-op runs. Everything else keeps the
+# per-pull-request group, so a new push supersedes the review it obsoletes.
 #
 # The condition is spelled the same way as the job guard, and
 # tests/test_canonical_pr_review_hardening.py binds the two to each other, so
 # one cannot be narrowed without the other.
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}${{ (github.event.action == 'edited' && github.event.changes.base == null) && '-skipped-edit' || '' }}
+  group: claude-review-${{ github.event.pull_request.number }}${{ ((github.event.action == 'edited' && github.event.changes.base == null) || ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'do-not-merge')) && '-skipped-event' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -102,14 +99,14 @@ jobs:
     # evaluates normally. The property survives either behaviour, because
     # neither result is the string `claude-review`; do not "simplify" this to
     # something whose unevaluated text could collide with the required context.
-    name: ${{ (github.event.action == 'edited' && github.event.changes.base == null) && 'metadata-edit-no-review' || 'claude-review' }}
-    # THE `edited` GUARD. See the note on the trigger list above: `edited` is
-    # kept for the base-branch change it is the only signal for, and skipped for
-    # the title/body edits that would re-run a byte-identical review. Evaluated
-    # before a runner is allocated, so a skipped edit spends nothing.
+    name: ${{ ((github.event.action == 'edited' && github.event.changes.base == null) || ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'do-not-merge')) && 'metadata-event-no-review' || 'claude-review' }}
+    # Metadata edits and unrelated label transitions neither re-review the
+    # same bytes nor supersede a live required verdict. `do-not-merge` remains
+    # an active review control, as does every base change.
     if: >-
-      github.event.action != 'edited'
-      || github.event.changes.base != null
+      (github.event.action != 'edited' || github.event.changes.base != null)
+      &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'do-not-merge')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     permissions:
@@ -870,8 +867,29 @@ jobs:
 
           changed_raw="$input_dir/changed-objects.raw"
           changed_blob_oids="$input_dir/changed-blob-oids"
-          git -C "$repository" diff --no-ext-diff --no-textconv --no-renames \
-            --raw --abbrev=40 -z "$EXPECTED_BASE_SHA" "$merge_tree" > "$changed_raw"
+          # Bound producer output before the validators read it into memory.
+          # A large tree or patch cannot consume unbounded runner disk or RAM.
+          bounded_git_output() {
+            local max_bytes="$1" output="$2"
+            shift 2
+            local materialize_status=0
+            timeout --kill-after=5s 30s git -C "$repository" "$@" \
+              | head -c "$((max_bytes + 1))" > "$output" \
+              || materialize_status=$?
+            test "$(wc -c < "$output")" -le "$max_bytes" \
+              || fail_source_assertion \
+                "Git materialization exceeds its byte ceiling; output=$(basename "$output") limit=${max_bytes} pr=${PR_NUMBER}" \
+                "source-acquisition-bound" \
+                "pr=${PR_NUMBER} output=$(basename "$output") limit=${max_bytes}"
+            test "$materialize_status" -eq 0 \
+              || fail_source_assertion \
+                "bounded Git materialization failed before validation; output=$(basename "$output") limit=${max_bytes} pr=${PR_NUMBER} status=${materialize_status}" \
+                "source-acquisition-bound" \
+                "pr=${PR_NUMBER} output=$(basename "$output") status=${materialize_status}"
+          }
+          bounded_git_output 8388608 "$changed_raw" \
+            diff --no-ext-diff --no-textconv --no-renames --raw --abbrev=40 -z \
+            "$EXPECTED_BASE_SHA" "$merge_tree"
           python3 - "$changed_raw" "$changed_blob_oids" <<'PY'
           import re
           import sys
@@ -948,14 +966,19 @@ jobs:
             > "$workflow_source"
           test -s "$workflow_source"
 
-          git -C "$repository" diff --no-ext-diff --no-textconv --no-renames \
-            --name-only -z "$EXPECTED_BASE_SHA" "$merge_tree" > "$names"
-          git -C "$repository" diff --no-ext-diff --no-textconv --no-renames \
-            --numstat -z "$EXPECTED_BASE_SHA" "$merge_tree" > "$numstat"
-          git -C "$repository" ls-tree -r -z "$EXPECTED_BASE_SHA" > "$base_tree"
-          git -C "$repository" ls-tree -r -z "$merge_tree" > "$head_tree"
-          git -C "$repository" diff --no-ext-diff --no-textconv --no-renames \
-            --unified=3 --full-index "$EXPECTED_BASE_SHA" "$merge_tree" > "$diff"
+          bounded_git_output 8388608 "$names" \
+            diff --no-ext-diff --no-textconv --no-renames --name-only -z \
+            "$EXPECTED_BASE_SHA" "$merge_tree"
+          bounded_git_output 16777216 "$numstat" \
+            diff --no-ext-diff --no-textconv --no-renames --numstat -z \
+            "$EXPECTED_BASE_SHA" "$merge_tree"
+          bounded_git_output 67108864 "$base_tree" \
+            ls-tree -r -z "$EXPECTED_BASE_SHA"
+          bounded_git_output 67108864 "$head_tree" \
+            ls-tree -r -z "$merge_tree"
+          bounded_git_output 1048576 "$diff" \
+            diff --no-ext-diff --no-textconv --no-renames \
+            --unified=3 --full-index "$EXPECTED_BASE_SHA" "$merge_tree"
 
           # This validator is protected workflow code. It reads bytes from the
           # bare object database and never executes or checks out PR content.
