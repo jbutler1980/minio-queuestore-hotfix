@@ -291,6 +291,21 @@ jobs:
           on_source_exit() {
             local status="$?"
             test "$status" -ne 0 || return 0
+            if [ -n "${source_admission_detail:-}" ] \
+              && [ -f "$source_admission_detail" ] \
+              && [ ! -L "$source_admission_detail" ]; then
+              local admission_detail=""
+              IFS= read -r admission_detail < "$source_admission_detail" || true
+              if [[ "$admission_detail" =~ ^[A-Za-z0-9_=\ ]{1,200}$ ]]; then
+                record_source_failure_stage "source-exceeds-admission" "$admission_detail"
+                if [ -n "${GITHUB_STEP_SUMMARY:-}" ] \
+                  && [ -f "$GITHUB_STEP_SUMMARY" ] \
+                  && [ ! -L "$GITHUB_STEP_SUMMARY" ]; then
+                  printf 'Adversarial review could not review: %s; use an independent review path.\n' \
+                    "$admission_detail" >> "$GITHUB_STEP_SUMMARY" || true
+                fi
+              fi
+            fi
             record_source_failure_stage "source-unclassified" \
               "exit_status=${status}"
           }
@@ -944,7 +959,10 @@ jobs:
 
           # This validator is protected workflow code. It reads bytes from the
           # bare object database and never executes or checks out PR content.
-          python3 - "$names" "$numstat" "$base_tree" "$head_tree" "$diff" <<'PY'
+          source_admission_detail="$RUNNER_TEMP/pr-review-source-admission.txt"
+          test ! -e "$source_admission_detail"
+          python3 - "$names" "$numstat" "$base_tree" "$head_tree" "$diff" \
+            "$source_admission_detail" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -955,8 +973,18 @@ jobs:
           MAX_PATCH_BYTES = 512 * 1024
 
           names, numstat, base_tree, head_tree, patch = (
-              Path(value).read_bytes() for value in sys.argv[1:]
+              Path(value).read_bytes() for value in sys.argv[1:6]
           )
+          admission_detail_path = Path(sys.argv[6])
+
+          def exceeds_admission(metric: str, actual: int, limit: int) -> None:
+              admission_detail_path.write_text(
+                  f"{metric}={actual} limit={limit}\n", encoding="ascii"
+              )
+              raise ValueError(
+                  f"{metric}={actual} exceeds limit={limit}; "
+                  "use an independent review path"
+              )
 
           def records(data: bytes) -> list[bytes]:
               return [record for record in data.split(b"\0") if record]
@@ -965,7 +993,7 @@ jobs:
           if not changed_files:
               raise ValueError("the exact diff is empty")
           if len(changed_files) > MAX_FILES:
-              raise ValueError(f"changed file count exceeds {MAX_FILES}")
+              exceeds_admission("changed_files", len(changed_files), MAX_FILES)
 
           changed_lines = 0
           stats = records(numstat)
@@ -980,12 +1008,10 @@ jobs:
                   raise ValueError("binary changes require an independent review path")
               per_file = int(additions) + int(deletions)
               if per_file > MAX_CHANGED_LINES_PER_FILE:
-                  raise ValueError(
-                      f"per-file changed line count exceeds {MAX_CHANGED_LINES_PER_FILE}"
-                  )
+                  exceeds_admission("changed_lines_per_file", per_file, MAX_CHANGED_LINES_PER_FILE)
               changed_lines += per_file
           if changed_lines > MAX_CHANGED_LINES:
-              raise ValueError(f"changed line count exceeds {MAX_CHANGED_LINES}")
+              exceeds_admission("changed_lines", changed_lines, MAX_CHANGED_LINES)
 
           for tree in (base_tree, head_tree):
               if any(record.startswith(b"160000 commit ") for record in records(tree)):
@@ -994,7 +1020,7 @@ jobs:
           if not patch:
               raise ValueError("the exact patch is empty")
           if len(patch) > MAX_PATCH_BYTES:
-              raise ValueError(f"patch size exceeds {MAX_PATCH_BYTES} bytes")
+              exceeds_admission("diff_bytes", len(patch), MAX_PATCH_BYTES)
           if b"\0" in patch:
               raise ValueError("patch contains a NUL byte")
           patch.decode("utf-8")
@@ -1076,6 +1102,21 @@ jobs:
           on_chunks_exit() {
             local status="$?"
             test "$status" -ne 0 || return 0
+            if [ -n "${chunk_admission_detail:-}" ] \
+              && [ -f "$chunk_admission_detail" ] \
+              && [ ! -L "$chunk_admission_detail" ]; then
+              local admission_detail=""
+              IFS= read -r admission_detail < "$chunk_admission_detail" || true
+              if [[ "$admission_detail" =~ ^[A-Za-z0-9_=\ ]{1,200}$ ]]; then
+                record_chunks_failure_stage "chunks-exceeds-admission" "$admission_detail"
+                if [ -n "${GITHUB_STEP_SUMMARY:-}" ] \
+                  && [ -f "$GITHUB_STEP_SUMMARY" ] \
+                  && [ ! -L "$GITHUB_STEP_SUMMARY" ]; then
+                  printf 'Adversarial review could not review: %s; use an independent review path.\n' \
+                    "$admission_detail" >> "$GITHUB_STEP_SUMMARY" || true
+                fi
+              fi
+            fi
             record_chunks_failure_stage "chunks-unclassified" \
               "exit_status=${status}"
           }
@@ -1083,8 +1124,10 @@ jobs:
 
           chunk_dir="$RUNNER_TEMP/pr-review-chunks"
           manifest="$RUNNER_TEMP/pr-review-manifest.json"
+          chunk_admission_detail="$RUNNER_TEMP/pr-review-chunk-admission.txt"
           test ! -e "$chunk_dir"
           test ! -e "$manifest"
+          test ! -e "$chunk_admission_detail"
 
           # This transformer is protected workflow code. It preserves every
           # reviewable byte except exact generated pip hash rows, which are
@@ -1094,7 +1137,8 @@ jobs:
             "$DIFF_FILE" "$chunk_dir" "$manifest" "$REPOSITORY_DIR" \
             "$GITHUB_REPOSITORY" "$PR_NUMBER" \
             "$EXPECTED_BASE_REF" "$EXPECTED_BASE_SHA" "$EXPECTED_HEAD_SHA" \
-            "$EXPECTED_MERGE_TREE_SHA" "$EXPECTED_WORKFLOW_SHA256" <<'PY'
+            "$EXPECTED_MERGE_TREE_SHA" "$EXPECTED_WORKFLOW_SHA256" \
+            "$chunk_admission_detail" <<'PY'
           import hashlib
           import json
           import re
@@ -1105,8 +1149,8 @@ jobs:
           MAX_CHUNK_BYTES = 5_500
           MAX_CONTEXT_BYTES = 384
           MAX_OVERLAP_BYTES = 128
-          MAX_REVIEW_CHUNKS = 64
-          MAX_REVIEW_REPRESENTATION_BYTES = 342 * 1024
+          MAX_REVIEW_CHUNKS = 72
+          MAX_REVIEW_REPRESENTATION_BYTES = 384 * 1024
           HASH_ROW = re.compile(
               r"^[+-][ \t]+--hash=sha256:[0-9a-f]{64}(?:[ \t]+\\)?(?:\r?\n)?$"
           )
@@ -1123,6 +1167,17 @@ jobs:
           base_ref = sys.argv[7]
           base_sha, head_sha, merge_tree_sha = sys.argv[8:11]
           workflow_sha256 = sys.argv[11]
+          admission_detail_path = Path(sys.argv[12])
+
+          def exceeds_admission(metric: str, actual: int, limit: int) -> None:
+              admission_detail_path.write_text(
+                  f"{metric}={actual} limit={limit}\n", encoding="ascii"
+              )
+              raise ValueError(
+                  f"{metric}={actual} exceeds limit={limit}; "
+                  "use an independent review path"
+              )
+
           exact = diff_path.read_bytes()
           text = exact.decode("utf-8")
 
@@ -1278,9 +1333,8 @@ jobs:
 
           review = "".join(output).encode("utf-8")
           if len(review) > MAX_REVIEW_REPRESENTATION_BYTES:
-              raise ValueError(
-                  "review representation exceeds the 342 KiB ordinary-diff "
-                  "boundary; use an independent review path"
+              exceeds_admission(
+                  "review_bytes", len(review), MAX_REVIEW_REPRESENTATION_BYTES
               )
 
           def lf_byte_lines(value: bytes):
@@ -1307,7 +1361,7 @@ jobs:
           for offset, line in lf_byte_lines(review):
               if line.startswith(b"diff --git "):
                   if len(line) > MAX_CONTEXT_BYTES:
-                      raise ValueError("a diff file header exceeds the context boundary")
+                      exceeds_admission("file_header_bytes", len(line), MAX_CONTEXT_BYTES)
                   current_file = context_text(line)
                   current_hunk = None
                   events.append((
@@ -1319,7 +1373,7 @@ jobs:
                   ))
               elif line.startswith(b"@@ "):
                   if len(line) > MAX_CONTEXT_BYTES:
-                      raise ValueError("a diff hunk header exceeds the context boundary")
+                      exceeds_admission("hunk_header_bytes", len(line), MAX_CONTEXT_BYTES)
                   current_hunk = context_text(line)
                   events.append((
                       offset,
@@ -1335,10 +1389,7 @@ jobs:
           current_start = 0
           for offset, line in lf_byte_lines(review):
               if len(line) > MAX_CHUNK_BYTES:
-                  raise ValueError(
-                      "a physical diff line exceeds the 5500-byte model boundary; "
-                      "use an independent review path"
-                  )
+                  exceeds_admission("diff_line_bytes", len(line), MAX_CHUNK_BYTES)
               if current and len(current) + len(line) > MAX_CHUNK_BYTES:
                   chunk_starts.append(current_start)
                   chunks.append(bytes(current))
@@ -1366,10 +1417,7 @@ jobs:
           if not chunks:
               raise ValueError("review representation is empty")
           if len(chunks) > MAX_REVIEW_CHUNKS:
-              raise ValueError(
-                  "review representation requires more than "
-                  f"{MAX_REVIEW_CHUNKS} model requests; use an independent review path"
-              )
+              exceeds_admission("chunks", len(chunks), MAX_REVIEW_CHUNKS)
           if b"".join(chunks) != review:
               raise ValueError("review chunks do not reconstruct the representation")
           if len(contexts) != len(chunks):
@@ -1468,7 +1516,7 @@ jobs:
               $review.review_representation_sha256
               | test("^[0-9a-f]{64}$")
             )
-            and ($review.chunk_count >= 1 and $review.chunk_count <= 64)
+            and ($review.chunk_count >= 1 and $review.chunk_count <= 72)
             and ($review.chunks | length == $review.chunk_count)
           ' "$manifest" >/dev/null \
             || {
@@ -1477,7 +1525,7 @@ jobs:
               # are read back with a non-authoritative `jq` whose failure
               # yields an empty detail, never an aborted diagnostic.
               record_chunks_failure_stage "chunks-manifest" \
-                "chunk_count=$(jq -r '.chunk_count // "none"' "$manifest" 2>/dev/null || printf 'unreadable') limit=64"
+                "chunk_count=$(jq -r '.chunk_count // "none"' "$manifest" 2>/dev/null || printf 'unreadable') limit=72"
               exit 1
             }
           {
@@ -1529,7 +1577,7 @@ jobs:
               raise ValueError("unsupported review protocol")
           if manifest["max_chunk_bytes"] != 5_500:
               raise ValueError("invalid review chunk byte boundary")
-          if not 1 <= manifest["chunk_count"] <= 64:
+          if not 1 <= manifest["chunk_count"] <= 72:
               raise ValueError("invalid review chunk count")
           if len(chunks) != manifest["chunk_count"]:
               raise ValueError("review chunk manifest count differs")
@@ -1610,7 +1658,7 @@ jobs:
               representation.extend(data)
               previous = data
 
-          if manifest["review_representation_bytes"] > 342 * 1024:
+          if manifest["review_representation_bytes"] > 384 * 1024:
               raise ValueError("review representation exceeds its byte boundary")
           if len(representation) != manifest["review_representation_bytes"]:
               raise ValueError("review representation byte count differs")
@@ -1755,7 +1803,7 @@ jobs:
 
           # THE KILL SWITCH IS RE-READ BEFORE EVERY OUTBOUND REQUEST.
           #
-          # It used to be read exactly once, as step 1 of the job. Between that
+          # It used to be read only at step 1 of the job. Between that
           # read and the first token of spend sit the fetch, the local merge and
           # the chunk build; after it sit up to 49 sampled `gpt-5.4` calls, each
           # retried up to five times. Flipping the flag to `off` stopped no run
@@ -4204,18 +4252,18 @@ jobs:
             || fail_aggregate_assertion "interface_facts_total=${interface_facts_total} (limit 32)"
           test "$completion_tokens_total" -le $((chunk_count * MAX_COMPLETION_TOKENS)) \
             || fail_aggregate_assertion "completion_tokens_total=${completion_tokens_total} (limit chunk_count*MAX_COMPLETION_TOKENS)"
-          test "$completion_tokens_total" -le 4194304 \
-            || fail_aggregate_assertion "completion_tokens_total=${completion_tokens_total} (limit 4194304)"
+          test "$completion_tokens_total" -le 4718592 \
+            || fail_aggregate_assertion "completion_tokens_total=${completion_tokens_total} (limit 4718592)"
           review_transcript_bytes="$(wc -c < "$review_transcript")"
           review_transcript_fixed_bytes=$((
             review_transcript_bytes - canonical_content_bytes_total
           ))
           test "$review_transcript_fixed_bytes" -ge 1 \
             || fail_aggregate_assertion "review_transcript_fixed_bytes=${review_transcript_fixed_bytes} (expected >=1)"
-          test "$review_transcript_fixed_bytes" -le 3000 \
-            || fail_aggregate_assertion "review_transcript_fixed_bytes=${review_transcript_fixed_bytes} (limit 3000)"
-          test "$review_transcript_bytes" -le 70000 \
-            || fail_aggregate_assertion "review_transcript_bytes=${review_transcript_bytes} (limit 70000)"
+          test "$review_transcript_fixed_bytes" -le 3200 \
+            || fail_aggregate_assertion "review_transcript_fixed_bytes=${review_transcript_fixed_bytes} (limit 3200)"
+          test "$review_transcript_bytes" -le 80000 \
+            || fail_aggregate_assertion "review_transcript_bytes=${review_transcript_bytes} (limit 80000)"
           review_transcript_sha256="$(
             sha256sum "$review_transcript" | cut -d' ' -f1
           )"
@@ -4478,11 +4526,11 @@ jobs:
           chunk_summaries_bytes="$(wc -c < "$chunk_summaries")"
           # Sized FROM the per-summary cap, not guessed: this file is a compact
           # JSON array of {chunk_index, summary, verdict}, so at
-          # MAX_REVIEW_CHUNKS = 64 has 3128 + 64*240 = 18488 bytes
-          # (18489 with the trailing newline). The 19000-byte
+          # MAX_REVIEW_CHUNKS = 72 has 3520 + 72*240 = 20800 bytes
+          # (20801 with the trailing newline). The 21000-byte
           # cap admits every legal summary array with a small margin.
-          test "$chunk_summaries_bytes" -le 19000 \
-            || fail_aggregate_assertion "chunk_summaries_bytes=${chunk_summaries_bytes} (limit 19000)"
+          test "$chunk_summaries_bytes" -le 21000 \
+            || fail_aggregate_assertion "chunk_summaries_bytes=${chunk_summaries_bytes} (limit 21000)"
           chunk_summaries_sha256="$(
             sha256sum "$chunk_summaries" | cut -d' ' -f1
           )"
@@ -4556,7 +4604,7 @@ jobs:
                 == $review.chunk_merit_failures
             )
             and ($review.chunk_merit_failures
-                 | type == "number" and floor == . and . >= 0 and . <= 64)
+                 | type == "number" and floor == . and . >= 0 and . <= 72)
             # INJECTION IS STILL REQUIRED OF EVERY CHUNK. This is now the only
             # per-chunk hard veto and it is unchanged.
             and all($review.chunk_reviews[]; .injection_detected == false)
@@ -4572,9 +4620,9 @@ jobs:
             # the synthesis has not been judged yet, so equality is asserted at
             # publication time (the verdict step), not here.
             and ($review.merit_confirmations
-                 | type == "number" and floor == . and . >= 0 and . <= 65)
+                 | type == "number" and floor == . and . >= 0 and . <= 73)
             and ($review.merit_disagreements
-                 | type == "number" and floor == . and . >= 0 and . <= 65)
+                 | type == "number" and floor == . and . >= 0 and . <= 73)
             # A disagreement is a confirmation whose second sample voted pass,
             # so disagreements can never exceed confirmations. The stronger
             # EQUALITY (no confirmed failure survived) is asserted at publication
@@ -4585,9 +4633,9 @@ jobs:
             and $review.interface_fact_count <= 32
             and $review.interface_ledger_bytes <= 10400
             and ($review.interface_ledger_sha256 | test("^[0-9a-f]{64}$"))
-            # Match the 19000-byte admission bound and both publication
-            # revalidators. The 64-record worst case is 18489 bytes.
-            and $review.chunk_summaries_bytes <= 19000
+            # Match the 21000-byte admission bound and both publication
+            # revalidators. The 72-record worst case is 20801 bytes.
+            and $review.chunk_summaries_bytes <= 21000
             and ($review.chunk_summaries_sha256 | test("^[0-9a-f]{64}$"))
           ' "$review_manifest" >/dev/null \
             || fail_aggregate_assertion "assembled review manifest failed its self-consistency check"
@@ -4747,7 +4795,7 @@ jobs:
                   # The header carries the three digests under review and, as a
                   # RUNNER-COMPUTED integer, the number of chunk records below
                   # whose verdict is not "pass" -- stated separately so the
-                  # dissent cannot be missed by a model that skims a 64-record
+                  # dissent cannot be missed by a model that skims a 72-record
                   # array, and so it is checkable against the array itself.
                   content: (
                     $synthesis_header
@@ -4876,7 +4924,7 @@ jobs:
             test "$synthesis_fixed_bytes" -le 2600 \
               || fail_aggregate_assertion "synthesis_fixed_bytes=${synthesis_fixed_bytes} (limit 2600)"
           # Budget: synthesis_fixed_bytes (<= 2600) + interface_ledger_bytes
-          # (<= 10400) + chunk_summaries_bytes (<= 19000) = 32000 worst case.
+          # (<= 10400) + chunk_summaries_bytes (<= 21000) = 34000 worst case.
           # 22000 was sized for the old 120-byte summary cap and a 48-chunk
           # review at 240 bytes measures 22973 decoded bytes, so leaving it
           # would have made a legal review unsendable. Luna input tokenization
@@ -4895,14 +4943,14 @@ jobs:
           # the assertion; the edit was rewritten to end 5 bytes SHORTER instead.
           # Before adding a single byte to that system prompt, measure the
           # DISSENT branch, not the pass branch. Raising the cap is not a local
-          # change either: 2600 + 10400 + 19000 is exactly the 32000 below.
+          # change either: 2600 + 10400 + 21000 is exactly the 34000 below.
           #
           # The end-to-end figure moves with it, and it was quoted from the pass
-          # branch too. The real worst case is 2583 + 19000 + 10400 = 31983
-          # against this 32000 bound -- SEVENTEEN bytes, where the pass-branch
-          # arithmetic (1682 + 19000 + 10400 = 31082) suggested 918. On the
+          # branch too. The real worst case is 2583 + 21000 + 10400 = 33983
+          # against this 34000 bound -- SEVENTEEN bytes, where the pass-branch
+          # arithmetic (1682 + 21000 + 10400 = 33082) suggested 918. On the
           # canonical this replaces the same figure was 26988, i.e. twelve.
-            enforce_message_boundary "$request" 32000
+            enforce_message_boundary "$request" 34000
           }
 
           # Sample 1. The internal seed retains the existing request shape;
@@ -5457,6 +5505,10 @@ jobs:
                 echo "Adversarial review: the reviewer did NOT reach a verdict; one of its own bounds was exceeded (stage=${stage})." >&2
                 echo "This is a reviewer/tooling failure, NOT a finding about this change." >&2
                 ;;
+              source-exceeds-admission|chunks-exceeds-admission)
+                echo "Adversarial review: the pull request exceeds admission limits (stage=${stage})." >&2
+                echo "The reviewer could not reach a verdict. Use an independent review path." >&2
+                ;;
               review-time-budget)
                 echo "Adversarial review: the reviewer did NOT reach a verdict before its internal time budget (stage=${stage})." >&2
                 ;;
@@ -5578,7 +5630,7 @@ jobs:
             # `if:` meant a failed review published nothing at all, so the sole
             # pull-request writer in this workflow never spoke. It now runs on
             # the `merit` stage as well. The permission string itself is written
-            # exactly once in this file and the fleet distributor counts it, so
+            # one occurrence in this file and the fleet distributor counts it, so
             # it is described here rather than quoted.
             #
             # ONLY the two SUBSTANTIVE stages. `merit` is "the reviewer read
@@ -5636,7 +5688,7 @@ jobs:
           test "$(printf '%s' "$EXPECTED_BASE_REF" | wc -c)" -le 512
           [[ "$EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_CHUNK_COUNT" =~ ^[1-9][0-9]*$ ]]
-          test "$EXPECTED_CHUNK_COUNT" -le 64
+          test "$EXPECTED_CHUNK_COUNT" -le 72
           [[ "$EXPECTED_CHUNK_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_COMPACTION_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_DIFF_SHA256" =~ ^[0-9a-f]{64}$ ]]
@@ -5690,10 +5742,10 @@ jobs:
             and .review.review_representation_sha256
               == $review_representation_sha256
             and .review.workflow_sha256 == $workflow_sha256
-            and .review.completion_tokens_total <= 4194304
+            and .review.completion_tokens_total <= 4718592
             and (
               .review.review_transcript_bytes
-              | type == "number" and . >= 1 and . <= 70000
+              | type == "number" and . >= 1 and . <= 80000
             )
             and (.review.review_transcript_sha256 | test("^[0-9a-f]{64}$"))
             and (
@@ -5702,7 +5754,7 @@ jobs:
             )
             and (
               .review.chunk_summaries_bytes
-              | type == "number" and . >= 1 and . <= 19000
+              | type == "number" and . >= 1 and . <= 21000
             )
             and (.review.chunk_summaries_sha256 | test("^[0-9a-f]{64}$"))
             and (
@@ -5717,11 +5769,11 @@ jobs:
             # evidence, so this fails closed. Asserted in BOTH revalidators.
             and (
               .review.merit_confirmations
-              | type == "number" and floor == . and . >= 0 and . <= 65
+              | type == "number" and floor == . and . >= 0 and . <= 73
             )
             and (
               .review.merit_disagreements
-              | type == "number" and floor == . and . >= 0 and . <= 65
+              | type == "number" and floor == . and . >= 0 and . <= 73
             )
             and .review.merit_confirmations == .review.merit_disagreements
             and (.review.interface_ledger_sha256 | test("^[0-9a-f]{64}$"))
@@ -5761,7 +5813,7 @@ jobs:
             = "$(jq -er .review_transcript_gzip_bytes "$response_manifest")"
           test "$(sha256sum "$transcript_gzip" | cut -d' ' -f1)" \
             = "$(jq -er .review_transcript_gzip_sha256 "$response_manifest")"
-          gzip -cd "$transcript_gzip" | head -c 70001 > "$transcript"
+          gzip -cd "$transcript_gzip" | head -c 80001 > "$transcript"
           test "$(wc -c < "$transcript")" \
             = "$(jq -er .review.review_transcript_bytes "$response_manifest")"
           test "$(sha256sum "$transcript" | cut -d' ' -f1)" \
@@ -6103,7 +6155,7 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           if [ "$publish_verdict" = "PASS" ]; then
           [[ "$EXPECTED_CHUNK_COUNT" =~ ^[1-9][0-9]*$ ]]
-          test "$EXPECTED_CHUNK_COUNT" -le 64
+          test "$EXPECTED_CHUNK_COUNT" -le 72
           [[ "$EXPECTED_CHUNK_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_COMPACTION_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_DIFF_SHA256" =~ ^[0-9a-f]{64}$ ]]
@@ -6154,10 +6206,10 @@ jobs:
             and .review.review_representation_sha256
               == $review_representation_sha256
             and .review.workflow_sha256 == $workflow_sha256
-            and .review.completion_tokens_total <= 4194304
+            and .review.completion_tokens_total <= 4718592
             and (
               .review.review_transcript_bytes
-              | type == "number" and . >= 1 and . <= 70000
+              | type == "number" and . >= 1 and . <= 80000
             )
             and (.review.review_transcript_sha256 | test("^[0-9a-f]{64}$"))
             and (
@@ -6166,7 +6218,7 @@ jobs:
             )
             and (
               .review.chunk_summaries_bytes
-              | type == "number" and . >= 1 and . <= 19000
+              | type == "number" and . >= 1 and . <= 21000
             )
             and (.review.chunk_summaries_sha256 | test("^[0-9a-f]{64}$"))
             and (
@@ -6181,11 +6233,11 @@ jobs:
             # evidence, so this fails closed. Asserted in BOTH revalidators.
             and (
               .review.merit_confirmations
-              | type == "number" and floor == . and . >= 0 and . <= 65
+              | type == "number" and floor == . and . >= 0 and . <= 73
             )
             and (
               .review.merit_disagreements
-              | type == "number" and floor == . and . >= 0 and . <= 65
+              | type == "number" and floor == . and . >= 0 and . <= 73
             )
             and .review.merit_confirmations == .review.merit_disagreements
             and (.review.interface_ledger_sha256 | test("^[0-9a-f]{64}$"))
@@ -6225,7 +6277,7 @@ jobs:
             = "$(jq -er .review_transcript_gzip_bytes "$response_manifest")"
           test "$(sha256sum "$transcript_gzip" | cut -d' ' -f1)" \
             = "$(jq -er .review_transcript_gzip_sha256 "$response_manifest")"
-          gzip -cd "$transcript_gzip" | head -c 70001 > "$transcript"
+          gzip -cd "$transcript_gzip" | head -c 80001 > "$transcript"
           test "$(wc -c < "$transcript")" \
             = "$(jq -er .review.review_transcript_bytes "$response_manifest")"
           test "$(sha256sum "$transcript" | cut -d' ' -f1)" \
