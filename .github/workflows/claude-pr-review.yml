@@ -3286,12 +3286,17 @@ jobs:
           report_merit_failures() {
             local confirmation_sample="$1"
             local scope
-            printf 'Adversarial review failed on merit: %s of %s judgements returned a fail that STANDS (each re-sampled once, confirmation_sample=%s).\n' \
-              "${#merit_failed_scopes[@]}" "$((chunk_count + 1))" \
+            printf 'Adversarial review failed on merit: %s standing failure scopes (synthesis confirmation_sample=%s).\n' \
+              "${#merit_failed_scopes[@]}" \
               "$confirmation_sample" >&2
             for scope in "${merit_failed_scopes[@]}"; do
-              printf '  standing merit failure: %s (confirmation_sample=%s)\n' \
-                "$scope" "$confirmation_sample" >&2
+              if [ "$scope" = "synthesis" ]; then
+                printf '  standing merit failure: %s (confirmation_sample=%s)\n' \
+                  "$scope" "$confirmation_sample" >&2
+              else
+                printf '  standing merit failure: %s (confirmation_sample=not_sampled)\n' \
+                  "$scope" >&2
+              fi
             done
             test -n "${GITHUB_STEP_SUMMARY:-}" || return 0
             test -f "$GITHUB_STEP_SUMMARY" || return 0
@@ -3299,7 +3304,7 @@ jobs:
             {
               printf '### Adversarial review: standing merit failures\n\n'
               printf 'Every judgement was evaluated; the run did not halt at the first\n'
-              printf 'failure. Each failure below was re-sampled once; the confirmation\n'
+              printf 'failure. Chunk findings are not re-sampled; the synthesis confirmation\n'
               # Markdown backticks are literal output, not shell substitutions.
               # shellcheck disable=SC2016
               printf 'sample outcome was `%s`.\n\n' "$confirmation_sample"
@@ -5364,15 +5369,12 @@ jobs:
             verdict="$(jq -er .verdict "$result")"
             injection="$(jq -r .injection_detected "$result")"
             coverage="$(jq -r .coverage_complete "$result")"
-            # DELIBERATELY NOT "chunk N/M: <verdict>". That exact form is what
-            # reviewer/review_gate.py::_MERIT_FAIL_LINE matches to decide a run
-            # failed on MERIT and to permanently block the 429 fallback override
-            # on this SHA. The per-chunk verdict is no longer a merit failure, so
-            # emitting the old form would make a recorded, non-gating `fail`
-            # veto the override on an unrelated 429 -- a silent regression with
-            # no code path anywhere near it. The classifier's merit signal moved
-            # to the synthesis line below; the old pattern is kept in the
-            # classifier only so PRE-CHANGE logs still classify correctly.
+            # This progress line deliberately does not match the terminal merit
+            # classifier in reviewer/review_gate.py. All chunks and synthesis
+            # must finish before the terminal all-chunks-pass gate classifies
+            # unresolved chunk failures. That gate emits "chunk N/M: fail" and
+            # permanently blocks a 429 fallback override on this SHA. A later
+            # tooling failure cannot turn unfinished progress into a verdict.
             echo "Adversarial review chunk ${index}/${chunk_count} verdict: ${verdict}"
             # These post-parse gates used to fail silently under `set -e`, so an
             # honest coverage_complete=false looked identical to a crash: the
@@ -5385,7 +5387,7 @@ jobs:
               exit 1
             }
             # SECURITY GATE -- unconditional, immediate, NEVER re-sampled, and
-            # now the ONLY per-chunk hard veto. A detected injection fails the
+            # the immediate per-chunk veto. A detected injection fails the
             # review here on the FIRST occurrence, whatever coverage says and
             # whatever the merit verdict says. Removing the per-chunk merit veto
             # below makes this MORE load-bearing, not less.
@@ -5433,33 +5435,22 @@ jobs:
               # wins, so the security stage above is what survives.
               fail_chunk_assertion "injection_detected=${injection} (expected false)"
             fi
-            # THE PER-CHUNK MERIT VERDICT IS RECORDED, NOT GATING -- exactly the
-            # idiom already used for coverage_complete above.
-            #
-            # Measured: the v3 fleet is 0 green in 14 runs. A run vetoes on ANY
-            # one chunk voting fail across up to 35 chunks, and each chunk is an
-            # independently sampled judgement of a model that returns both
-            # verdicts on byte-identical bytes (docs/reviewer-determinism.md). At
-            # a per-chunk false-fail rate of only 0.1 that is 0.9^35 = 2.5% green
-            # -- which is 0-for-14 exactly. A veto that fires 97.5% of the time on
-            # correct code is not measuring the code.
-            #
-            # The verdict and its summary stay in the evidence: .verdict rides in
-            # chunk_reviews, the summary rides in chunk_summaries, and BOTH are
-            # fed to the synthesis. The blocking merit decision is the single
-            # independent synthesis judgement below, which sees every chunk
-            # summary at once -- and that one is confirm-on-fail protected.
+            # RECORD CHUNK MERIT WITHOUT EXITING EARLY. Every judgement remains
+            # available to synthesis and diagnosis. The terminal gate still
+            # requires every chunk to pass: a passing synthesis cannot overrule
+            # these failures. Synthesis has its own confirm-on-fail protection;
+            # chunks are not re-sampled by that confirmation.
             if [ "$verdict" != "pass" ]; then
               chunk_merit_failures=$((chunk_merit_failures + 1))
-              printf 'Adversarial review chunk %s/%s: verdict=%s recorded as evidence (per-chunk verdicts do not gate; the synthesis decides)\n' \
+              printf 'Adversarial review chunk %s/%s: verdict=%s recorded as evidence (per-chunk verdicts do not gate alone; terminal PASS requires every chunk to pass)\n' \
                 "$index" "$chunk_count" "$verdict" >&2
             fi
-            # COVERAGE IS RECORDED, NOT GATING. The global interface-fact cap
+            # COVERAGE IS RECORDED FOR DIAGNOSIS. The global interface-fact cap
             # and the per-field byte limits legitimately force an honest
             # reviewer to report coverage_complete=false on a complex diff.
             # Failing the run for that punished honesty and silently killed the
-            # gate; the verdict above is what decides safety. Partial coverage
-            # is carried into the manifest and published as such.
+            # gate. Keep partial coverage in the diagnostic manifest, but the
+            # terminal PASS gate below requires complete coverage.
             if [ "$coverage" != "true" ]; then
               partial_coverage=true
               printf 'Adversarial review chunk %s/%s: coverage_complete=false (partial coverage recorded, verdict still %s)\n' \
@@ -5800,12 +5791,9 @@ jobs:
 
           # THE PER-CHUNK VERDICT TRAVELS WITH THE SUMMARY.
           #
-          # This is what makes "recorded, not gating" sound. Dropping the
-          # per-chunk merit veto is only safe if the judgement that DOES gate can
-          # see the dissent; carrying only {chunk_index, summary} would have made
-          # a chunk that explicitly voted `fail` invisible to the single gating
-          # decision, turning a noisy false FAIL into a silent false PASS. That is
-          # the one trade that is strictly worse than the flaky veto it replaced.
+          # Synthesis sees every chunk judgement, including dissent, so the full
+          # record remains useful for diagnosis. The terminal gate independently
+          # rejects any unresolved chunk failure; synthesis cannot waive it.
           #
           # The verdict is a two-value enum produced by the runner from a
           # schema-validated response, not free text, so carrying it adds no new
@@ -6486,11 +6474,11 @@ jobs:
           fi
           test "$synthesis_injection" = "false" \
             || fail_aggregate_assertion "synthesis injection_detected=${synthesis_injection} (expected false)"
-          # THE one blocking merit decision. It is the independent judgement that
+          # The synthesis is an independent blocking merit decision. It is the judgement that
           # sees every chunk summary and the interface ledger at once, it is
           # sampled once per run rather than once per chunk, and it is the only
           # merit verdict confirm-on-fail protects -- because it is the only merit
-          # verdict that gates.
+          # verdict that uses confirm-on-fail. Unresolved chunk failures also veto PASS.
           #
           # This line is emitted in exactly the shape
           # reviewer/review_gate.py::_SYNTHESIS_MERIT_FAIL_LINE matches, so a
@@ -6584,6 +6572,24 @@ jobs:
             printf 'Adversarial review synthesis failed on merit: verdict=%s, confirmation_sample=%s.\n' \
               "$synthesis_verdict" "$synthesis_confirm_outcome" >&2
           fi
+          # A synthesis PASS cannot clear an unresolved chunk verdict. Keep
+          # every judgement for diagnosis, then veto before deriving evidence.
+          if [ "$chunk_merit_failures" -gt 0 ]; then
+            merit_failed_scopes+=("chunks")
+            {
+              printf 'REVIEWED AND FAILED -- unresolved chunk merit findings.\n'
+              printf 'synthesis verdict: %s; dissenting chunks: %s\n' \
+                "$synthesis_verdict" "$chunk_merit_failures"
+              jq -r '.[] | select(.verdict != "pass")
+                | "  chunk \(.chunk_index): \(.verdict) - \(.summary)"' \
+                "$chunk_summaries"
+            } >> "$OBJECTION_FILE"
+            while IFS= read -r failed_chunk; do
+              printf 'Adversarial review chunk %s/%s: fail\n' \
+                "$failed_chunk" "$chunk_count" >&2
+            done < <(jq -r '.[] | select(.verdict != "pass") | .chunk_index' \
+              "$chunk_summaries")
+          fi
           # Every judgement -- every chunk and the synthesis -- has now been
           # evaluated. This is the earliest point at which CHANGE 2 can report,
           # and it is before any evidence is derived or any output is written.
@@ -6608,6 +6614,11 @@ jobs:
               } >> "$GITHUB_OUTPUT"
             fi
             exit 1
+          fi
+          # Incomplete coverage is not a safety verdict. It cannot authorize
+          # PASS even when every sampled judgement returned pass.
+          if [ "$partial_coverage" != "false" ]; then
+            fail_aggregate_assertion "partial_coverage=${partial_coverage}; incomplete review cannot produce PASS"
           fi
           # A run that reaches here resolved every re-sampled judgement to pass,
           # so the two counters are equal by construction. Asserted, not assumed:
@@ -7068,6 +7079,8 @@ jobs:
               | type == "number" and . >= 0 and . <= 32 and floor == .
             )
             and (.review.partial_coverage | type == "boolean")
+            and .review.partial_coverage == false
+            and .review.chunk_merit_failures == 0
             # PUBLICATION INVARIANT for confirm-on-fail: a run may only publish
             # when every judgement that was re-sampled resolved to `pass`, i.e.
             # every confirmation was a disagreement. A published manifest whose
@@ -7546,6 +7559,8 @@ jobs:
               | type == "number" and . >= 0 and . <= 32 and floor == .
             )
             and (.review.partial_coverage | type == "boolean")
+            and .review.partial_coverage == false
+            and .review.chunk_merit_failures == 0
             # PUBLICATION INVARIANT for confirm-on-fail: a run may only publish
             # when every judgement that was re-sampled resolved to `pass`, i.e.
             # every confirmation was a disagreement. A published manifest whose
@@ -8091,4 +8106,3 @@ jobs:
           done
           echo "Unable to confirm compensation or deletion of published PASS evidence." >&2
           exit 1
-
