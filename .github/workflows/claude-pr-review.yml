@@ -6251,7 +6251,7 @@ jobs:
           # DISSENT branch, not the pass branch. Raising the cap is not a local
           # change either: 2600 + 10400 + 21000 is exactly the 34000 below.
           #
-          # The real worst case is 2514 + 21000 + 10400 = 33914, 86 bytes
+          # The real worst case is 2592 + 21000 + 10400 = 33992, 8 bytes
           # under the boundary. The dissent prompt is measured by the
           # synthesis_fixed_bytes test; keep this sum aligned with that value.
             enforce_message_boundary "$request" 34000
