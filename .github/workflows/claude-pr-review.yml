@@ -1963,17 +1963,9 @@ jobs:
                   for anchor in changed_anchors
                   if chunk_start <= anchor[0] < chunk_end
               ]
-              # One source excerpt is deliberately selected per chunk. Prefer
-              # the first path admitted by the protected-base policy; an
-              # excluded metadata change at the start of a mixed chunk must
-              # not consume the sole slot before changed application code.
-              # A chunk can begin
-              # mid-hunk or mid-function, so anchoring the excerpt there lets
-              # its bounded source prefix recover preceding authorization
-              # and binding steps that the split diff cannot carry. The exact
-              # diff remains complete; this does not multiply requests or
-              # widen the fixed request ceiling. Prefer merge-tree locations;
-              # deletion-only chunks use base-tree locations.
+              # Prefer an admitted candidate excerpt. A mid-file boundary must
+              # keep its first changed file as the source anchor; selecting a
+              # later file would discard that boundary's file/hunk context.
               merge_anchors = [
                   anchor for anchor in chunk_anchors
                   if anchor[1] == merge_tree_sha
@@ -1984,6 +1976,14 @@ jobs:
                    if source_path_omission(anchor[2]) is None),
                   eligible_anchors[0] if eligible_anchors else None,
               )
+              if (chunk_anchors and active_context["file_header"] is not None
+                      and not chunks[chunk_index].startswith(
+                          str(active_context["file_header"]).encode("utf-8"))):
+                  first_path = chunk_anchors[0][2]
+                  selected_anchor = next(
+                      (anchor for anchor in eligible_anchors if anchor[2] == first_path),
+                      chunk_anchors[0],
+                  )
               anchors = (
                   [(selected_anchor[1], selected_anchor[2], selected_anchor[3])]
                   if selected_anchor is not None else []
@@ -4682,10 +4682,10 @@ jobs:
                             + "lines to assess assignment and use order. When "
                             + "the code that would hold a guard, validation, "
                             + "early return, bounds check or invariant lies "
-                            + "OUTSIDE the shown regions, do not return fail "
-                            + "because it appears missing: absence of evidence "
-                            + "in the shown regions is not evidence of absence, "
-                            + "so record it in summary as unverified instead. "
+                            + "OUTSIDE the shown regions, do not infer a defect "
+                            + "merely from its absence. If missing context is "
+                            + "needed to decide a control-flow claim, set verdict=fail "
+                            + "and describe the uncertainty as INCONCLUSIVE in summary. "
                             + "This exemption does NOT apply when the "
                             + "diff itself adds the unguarded path: if the added "
                             + "lines you can see introduce a code path and "
@@ -6063,8 +6063,9 @@ jobs:
                     + "one bounded source excerpt from an immutable base or merge tree. "
                     + "No whole file was shown. If a guard, validation, early return, "
                     + "bounds check or invariant lies OUTSIDE the shown regions, do not "
-                    + "return fail: absence of evidence in the shown regions is not "
-                    + "evidence of absence; mark unverified. This "
+                    + "infer a defect merely from its absence. If missing context is "
+                    + "needed to decide a control-flow claim, set verdict=fail and "
+                    + "describe the uncertainty as INCONCLUSIVE in rationale. This "
                     + "exemption does NOT apply when the diff itself adds the unguarded "
                     + "path: if added lines introduce a code path and contain no such "
                     + "guard, that is visible evidence and you must weigh it normally. "
