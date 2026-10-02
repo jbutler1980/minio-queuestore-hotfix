@@ -1261,7 +1261,7 @@ jobs:
           MAX_SOURCE_FILE_BYTES = 2 * 1024 * 1024
           MAX_SOURCE_EXCERPT_BYTES = 4_096
           MAX_SOURCE_RENDERED_BYTES_PER_CHUNK = 5 * 1024
-          MAX_SOURCE_CONTEXTS_PER_CHUNK = 1
+          MAX_SOURCE_CONTEXTS_PER_CHUNK = 2  # One excerpt and one bounded omission.
           MAX_SOURCE_CONTEXT_BYTES_PER_CHUNK = 4 * 1024
           MAX_SOURCE_CONTEXT_BYTES_PER_REVIEW = 384 * 1024
           MAX_GLOBAL_SOURCE_CONTEXT_BYTES = 384 * 1024
@@ -1336,6 +1336,7 @@ jobs:
                       "git",
                       "-C",
                       str(repository_dir),
+                      "--literal-pathspecs",
                       "ls-tree",
                       "-z",
                       tree,
@@ -1497,7 +1498,7 @@ jobs:
 
           def tree_entry(tree_sha: str, path: str) -> tuple[str, str, str]:
               listing = subprocess.run(
-                  ["git", "-C", str(repository_dir), "ls-tree", "-z",
+                  ["git", "-C", str(repository_dir), "--literal-pathspecs", "ls-tree", "-z",
                    tree_sha, "--", path],
                   check=True, capture_output=True, timeout=10,
               ).stdout
@@ -1616,6 +1617,11 @@ jobs:
               lines = io.StringIO(text).readlines()
               edits: dict[int, list[tuple[int, int, str]]] = {}
               for token in tokenize.generate_tokens(io.StringIO(text).readline):
+                  if token.type == tokenize.ERRORTOKEN:
+                      # Older tokenizer versions can emit a partial malformed
+                      # literal as ordinary names after an error token. Omit
+                      # the entire supplementary excerpt before disclosure.
+                      raise tokenize.TokenError("invalid source token", token.start)
                   if token.type == tokenize.COMMENT:
                       row, column = token.start
                       content_end = len(lines[row - 1].rstrip("\r\n"))
@@ -1760,6 +1766,12 @@ jobs:
                           + " reason=" + str(record["omitted_reason"])
                           + " path=" + str(record["path"])
                           + " line=" + str(record["line_start"])
+                          + (". This bounded notice also covers further eligible anchors in this chunk without source context"
+                             if record["omitted_reason"] in {
+                                 "chunk-anchor-context-limit", "chunk-context-byte-limit",
+                                 "chunk-rendered-context-limit", "aggregate-review-context-limit",
+                                 "aggregate-manifest-context-limit",
+                             } else "")
                           + ". The full diff is still reviewed. This omission is "
                           "not evidence of correctness; if the missing context is "
                           "needed to decide a control-flow claim, set verdict=fail and describe the uncertainty as INCONCLUSIVE in summary."
@@ -1989,6 +2001,35 @@ jobs:
                   if selected_anchor is not None else []
               )
               source_contexts = source_contexts_for_anchors(anchors)
+              # Selecting one supplementary excerpt must not imply that all
+              # other changed anchors have surrounding source context. Keep
+              # one bounded marker for the first eligible anchor not shown.
+              if source_policy.get("enabled") and source_contexts:
+                  unshown_anchor = next((
+                      anchor for anchor in eligible_anchors
+                      if anchor != selected_anchor
+                      and source_path_omission(anchor[2]) is None
+                      and len(anchor[2].encode("utf-8")) <= MAX_CONTEXT_BYTES
+                      and not any(ord(char) < 32 or ord(char) == 127 for char in anchor[2])
+                      and not any(part in {"", ".", ".."} for part in anchor[2].split("/"))
+                      and not any(
+                          "excerpt" in record
+                          and record["tree_sha"] == anchor[1]
+                          and record["path"] == anchor[2]
+                          and record["line_start"] <= anchor[3] <= record["line_end"]
+                          for record in source_contexts
+                      )
+                  ), None)
+                  if unshown_anchor is not None:
+                      source_contexts.append(omission_record(
+                          unshown_anchor[1], unshown_anchor[2], unshown_anchor[3],
+                          "chunk-anchor-context-limit",
+                      ))
+                  if len(render_source_context(source_contexts).encode("utf-8")) > MAX_SOURCE_RENDERED_BYTES_PER_CHUNK:
+                      tree_sha, path, line_number = anchors[0]
+                      source_contexts = [omission_record(
+                          tree_sha, path, line_number, "chunk-rendered-context-limit"
+                      )]
               rendered_context_bytes = len(
                   render_source_context(source_contexts).encode("utf-8")
               )
@@ -2270,7 +2311,7 @@ jobs:
               if approved is None:
                   return {"authorized": False, "enabled": False, "roots": []}
               listing = subprocess.run(
-                  ["git", "-C", str(repository_dir), "ls-tree", "-z",
+                  ["git", "-C", str(repository_dir), "--literal-pathspecs", "ls-tree", "-z",
                    expected_base_sha, "--", SOURCE_CONTEXT_POLICY_PATH],
                   check=True, capture_output=True, timeout=10,
               ).stdout
@@ -2367,6 +2408,10 @@ jobs:
               lines = io.StringIO(text).readlines()
               edits = {}
               for token in tokenize.generate_tokens(io.StringIO(text).readline):
+                  if token.type == tokenize.ERRORTOKEN:
+                      # Match the producer even on tokenizer versions that
+                      # emit error tokens instead of raising TokenError.
+                      raise tokenize.TokenError("invalid source token", token.start)
                   if token.type == tokenize.COMMENT:
                       row, column = token.start
                       end = len(lines[row - 1].rstrip("\r\n"))
@@ -2438,6 +2483,12 @@ jobs:
                           + " reason=" + str(record["omitted_reason"])
                           + " path=" + str(record["path"])
                           + " line=" + str(record["line_start"])
+                          + (". This bounded notice also covers further eligible anchors in this chunk without source context"
+                             if record["omitted_reason"] in {
+                                 "chunk-anchor-context-limit", "chunk-context-byte-limit",
+                                 "chunk-rendered-context-limit", "aggregate-review-context-limit",
+                                 "aggregate-manifest-context-limit",
+                             } else "")
                           + ". The full diff is still reviewed. This omission is "
                           "not evidence of correctness; if the missing context is "
                           "needed to decide a control-flow claim, set verdict=fail and describe the uncertainty as INCONCLUSIVE in summary."
@@ -2480,7 +2531,7 @@ jobs:
               raise ValueError("review chunk manifest digest differs")
 
           source_contexts = manifest.get("source_contexts")
-          if not isinstance(source_contexts, list) or len(source_contexts) > 72:
+          if not isinstance(source_contexts, list) or len(source_contexts) > 144:
               raise ValueError("source context manifest is missing or oversized")
           canonical_source_contexts = json.dumps(
               source_contexts, separators=(",", ":"), sort_keys=True
@@ -2545,6 +2596,7 @@ jobs:
                       "context-path-not-canonical", "anchor-exceeds-excerpt-budget",
                       "anchor-line-out-of-range",
                       "chunk-context-byte-limit", "chunk-rendered-context-limit",
+                      "chunk-anchor-context-limit",
                       "aggregate-review-context-limit",
                       "aggregate-manifest-context-limit",
                   }
@@ -2566,7 +2618,7 @@ jobs:
                       raise ValueError("source context path omission is inconsistent")
                   if omitted_reason == "symlink-entry":
                       listing = subprocess.run(
-                          ["git", "-C", str(repository_dir), "ls-tree", "-z",
+                          ["git", "-C", str(repository_dir), "--literal-pathspecs", "ls-tree", "-z",
                            tree_sha, "--", path],
                           check=True, capture_output=True, timeout=10,
                       ).stdout
@@ -2589,7 +2641,7 @@ jobs:
                               or path_omission_reason(path) is not None):
                           raise ValueError("omitted source is outside protected disclosure policy")
                       listing = subprocess.run(
-                          ["git", "-C", str(repository_dir), "ls-tree", "-z",
+                          ["git", "-C", str(repository_dir), "--literal-pathspecs", "ls-tree", "-z",
                            tree_sha, "--", path],
                           check=True, capture_output=True, timeout=10,
                       ).stdout
@@ -2639,6 +2691,7 @@ jobs:
                       return (tree_sha, path, start, end, blob_oid, omitted_reason)
                   if omitted_reason in {
                       "chunk-context-byte-limit", "chunk-rendered-context-limit",
+                      "chunk-anchor-context-limit",
                       "aggregate-review-context-limit", "aggregate-manifest-context-limit",
                   } and not source_policy.get("enabled"):
                       raise ValueError("aggregate omission without an enabled policy")
@@ -2649,7 +2702,7 @@ jobs:
               if not re.fullmatch(r"[0-9a-f]{40}", blob_oid):
                   raise ValueError("source context blob identity is invalid")
               listing = subprocess.run(
-                  ["git", "-C", str(repository_dir), "ls-tree", "-z",
+                  ["git", "-C", str(repository_dir), "--literal-pathspecs", "ls-tree", "-z",
                    tree_sha, "--", path],
                   check=True, capture_output=True, timeout=10,
               ).stdout
@@ -2733,7 +2786,9 @@ jobs:
                   raise ValueError("review chunk has no source-context declaration")
               chunk_sources = context["source_contexts"]
               if (not isinstance(chunk_sources, list)
-                      or len(chunk_sources) > 1):
+                      or len(chunk_sources) > 2
+                      or sum("excerpt" in record for record in chunk_sources
+                             if isinstance(record, dict)) > 1):
                   raise ValueError("invalid review chunk source context count")
               chunk_source_bytes = 0
               for record in chunk_sources:
@@ -4526,6 +4581,12 @@ jobs:
                         + source_revision_label(.tree_sha; $review.base_sha; $review.head_sha; $review.merge_tree_sha)
                         + " reason=" + .omitted_reason + " path=" + .path + " line="
                         + (.line_start | tostring)
+                        + (if (.omitted_reason == "chunk-anchor-context-limit"
+                            or .omitted_reason == "chunk-context-byte-limit"
+                            or .omitted_reason == "chunk-rendered-context-limit"
+                            or .omitted_reason == "aggregate-review-context-limit"
+                            or .omitted_reason == "aggregate-manifest-context-limit") then
+                            ". This bounded notice also covers further eligible anchors in this chunk without source context" else "" end)
                         + ". The full diff is still reviewed. This omission is not evidence of correctness; if the missing context is needed to decide a control-flow claim, set verdict=fail and describe the uncertainty as INCONCLUSIVE in summary."
                       else
                         source_revision_label(.tree_sha; $review.base_sha; $review.head_sha; $review.merge_tree_sha)
@@ -5584,6 +5645,12 @@ jobs:
                           + " reason=" + str(record["omitted_reason"])
                           + " path=" + str(record["path"])
                           + " line=" + str(record["line_start"])
+                          + (". This bounded notice also covers further eligible anchors in this chunk without source context"
+                             if record["omitted_reason"] in {
+                                 "chunk-anchor-context-limit", "chunk-context-byte-limit",
+                                 "chunk-rendered-context-limit", "aggregate-review-context-limit",
+                                 "aggregate-manifest-context-limit",
+                             } else "")
                           + ". The full diff is still reviewed. This omission is "
                           "not evidence of correctness; if the missing context is "
                           "needed to decide a control-flow claim, set verdict=fail and describe the uncertainty as INCONCLUSIVE in summary."
