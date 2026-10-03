@@ -4486,8 +4486,40 @@ jobs:
           canonical_content_bytes_total=0
           interface_facts_total=0
           # Set true if ANY chunk reported coverage_complete=false. Recorded and
-          # published; never a gate.
+          # published as ADVISORY evidence. It is NOT a gate by itself.
+          #
+          # THE TERMINAL COVERAGE RULE (Task 45; docs/reviewer-determinism.md).
+          # Measured: on gpt-6-luna/high about 60% of chunks honestly report
+          # coverage_complete=false (the 2-fact cap forces it) even when every
+          # verdict is pass, so a gate on "no partial chunk" passed a 4-chunk
+          # PR 1-2% of the time while the schema text already says honest
+          # partial coverage "must never change the verdict". The rule, in
+          # precedence order:
+          #   1. injection_detected anywhere            -> FAIL (immediate).
+          #   2. a chunk/synthesis that is missing, malformed, errored or
+          #      whose API call failed                  -> NO VERDICT.
+          #   3. any chunk verdict fail / standing synthesis fail -> FAIL.
+          #   4. a PASS chunk with coverage_complete=false that is SECURITY-
+          #      RELEVANT could hide a finding: it is re-reviewed ONCE, with a
+          #      security-scoped request over the identical bound messages.
+          #      Security-relevant means EITHER the model reported a grounded
+          #      fact of kind auth or role guards/removes, OR -- independent of
+          #      what the model chose to list, because a partial reply may have
+          #      dropped exactly the security fact -- the runner finds a closed
+          #      list of security terms on the chunk's added/removed lines.
+          #      Still partial on a security-relevant fact -> NO VERDICT
+          #      (stage coverage-unresolved); the re-review failing -> FAIL.
+          #   5. otherwise partial coverage is advisory and the review may PASS.
+          # The re-review is never repeated: a second sample is allowed to
+          # CLEAR nothing but its own answer, and a security control is not
+          # re-rolled until it passes.
           partial_coverage=false
+          partial_coverage_chunks=0
+          security_rereviews=0
+          security_partial_unresolved=0
+          security_rereviews_cleared=0
+          security_rereviews_failed=0
+          rereview_pass=0
           # CONFIRM-ON-FAIL (MERIT ONLY) + EVALUATE-ALL.
           #
           # docs/reviewer-determinism.md measured, on byte-identical input with
@@ -4504,6 +4536,44 @@ jobs:
           # binding, evidence grounding and transport errors all still fail on the
           # FIRST occurrence with no resample -- re-rolling a security control is
           # how an attacker retries until a sample misses.
+          # RUNNER-SIDE SECURITY SCOPE, independent of model output. A closed
+          # list of security terms on the chunk's ADDED/REMOVED lines only
+          # (never context, never hunk headers). Over-matching costs one extra
+          # scoped call on a partial chunk; under-matching is the hole this
+          # exists to close, so the list leans broad on purpose.
+          # THE TERM LIST. Case-insensitive SUBSTRINGS (camelCase and snake_case
+          # both match), applied to a chunk's changed lines AND to its file
+          # paths / hunk header from the manifest (a chunk that begins mid-file
+          # carries its `diff --git` header only in the manifest context).
+          # False positives cost one extra scoped call; misses skip a re-review.
+          #
+          # DELIBERATELY ABSENT because they match nearly everything and carry
+          # no signal: http, query, template (render_template_string stays as
+          # `template_string`), env (environ/getenv stay),
+          # mount (volumeMounts), debug (logging), skip, disable, fetch,
+          # compare (compare_digest stays under digest), origin (git origin;
+          # allow_origin / access-control stay), root, uid, bare exec / eval
+          # ("execution", "evaluate"; call forms exec( and eval( stay), bare
+          # rsa / aes (versatile, aesthetic; word-bounded forms stay).
+          # KEPT ON PURPOSE despite being common: `owner` (ownership compares
+          # are authorization), `.user` (request.user / obj.user ownership
+          # checks), `shell` (shell=True / shell: true), `access`, `polic`,
+          # `execute` (cursor.execute), `sql`, `random` (non-crypto RNG).
+          # Process-spawn forms are listed individually (execsync, execfile,
+          # exec.command, spawn) because bare `exec` stays dropped. Pipe-to-shell
+          # is matched as `| sh` / `|sh`; bare curl, wget, registry and https
+          # URLs stay unmatched (health checks, downloads, image names).
+          SECURITY_TERMS='hash|digest|checksum|nonce|salt|kms|vault|ssh|gpg|pgp|x509|hmac|signature|crypt|md5|sha1|\baes\b|\brsa\b|ecb|iterations|kdf|pbkdf|argon|random|constant_time|auth|perm|role|scope|grant|entitle|principal|identity|privilege|rbac|acl|credential|secret|passw|api[_-]?key|bearer|token|csrf|cors|oauth|jwt|sanitiz|sanitis|escape|allowlist|denylist|whitelist|blacklist|sudo|setuid|securitycontext|networkpolicy|runasuser|runasgroup|admin|login|session|cookie|guard|validat|verif|trust|tls|ssl|cert|inject|polic|access|owner|isolat|sandbox|staff|superuser|user_id|userid|\.user\b|deny|forbid|bypass|insecure|unsafe|noverify|redact|pii|chmod|chown|umask|capabilit|privileged|hostnetwork|hostpath|hostpid|firewall|egress|ingress|cidr|proxy|socket|urlopen|requests\.|redirect|referer|samesite|httponly|csp|hsts|allow_origin|allow-origin|access-control|pickle|marshal|yaml\.load|deserial|unserial|readobject|eval\(|exec\(|subprocess|popen|system\(|shell|sql|execute|raw\(|\.\./|traversal|realpath|abspath|symlink|path\.join|environ|getenv|xml|template_string|execsync|execfile|execv|exec\.command|spawn|child_process|os/exec|new function\(|vm\.run|runasnonroot|nonroot|user root|getuid|geteuid|innerhtml|mark_safe|dangerous|v-html|\| *safe\b|\| *(ba)?sh\b|http://|action"? *: *"\*"|postinstall|preinstall|index-url|0\.0\.0\.0|max[-_ ]?age|expir'
+          chunk_touches_security() {
+            local chunk_file="$1"
+            local paths_file="$2"
+            # ONE grep per input, no pipe: `producer | grep -q` under pipefail
+            # fails BECAUSE it matched (SIGPIPE on the producer).
+            if grep -Eiq "^[+-].*(${SECURITY_TERMS})" "$chunk_file"; then
+              return 0
+            fi
+            grep -Eiq "(${SECURITY_TERMS})" "$paths_file"
+          }
           MERIT_CONFIRM_SAMPLES=2
           merit_confirmations=0
           merit_disagreements=0
@@ -4625,6 +4695,7 @@ jobs:
               --arg effort "$REASONING_EFFORT" \
               --argjson index "$index" \
               --argjson fact_limit "$interface_fact_limit" \
+              --argjson rereview "$rereview_pass" \
               --rawfile meta "$chunk_meta" \
               --rawfile chunk "$chunk" \
               --slurpfile context "$chunk_context" \
@@ -4725,7 +4796,22 @@ jobs:
                         coverage_complete: {
                           type: "boolean",
                           description: (
-                            "False if the interface facts above do not capture "
+                            (if $rereview == 1 then
+                              "SECURITY RE-REVIEW of this same chunk. The previous "
+                              + "review reported coverage_complete=false on a chunk "
+                              + "that touches a security-relevant interface. List "
+                              + "security-relevant interfaces FIRST: authentication, "
+                              + "authorization, guards, validation, and the removal "
+                              + "of any of these; other facts may be dropped, and "
+                              + "you may assess further security-relevant interfaces "
+                              + "without listing them. For THIS review "
+                              + "coverage_complete is false ONLY if some "
+                              + "security-relevant interface of this chunk could not "
+                              + "be assessed for the verdict. Decide the verdict "
+                              + "afresh: if you cannot conclude, set verdict=fail "
+                              + "and write INCONCLUSIVE in summary. "
+                             else "" end)
+                            + "False if the interface facts above do not capture "
                             + "everything this chunk exposes. Honest partial "
                             + "coverage is recorded, not penalised; it must "
                             + "never change the verdict."
@@ -5404,6 +5490,69 @@ jobs:
               exit 1
             fi
             chmod 0600 "$result"
+            # SECURITY-RELEVANT PARTIAL COVERAGE (rule 4 above). Only a chunk
+            # that PASSED, reported no injection and is partial qualifies; a fail
+            # or an injection verdict proceeds to its own (unchanged) gate. The
+            # predicate reads the grounded facts the schema validator already
+            # accepted, so it cannot be widened by free text.
+            content_security=false
+            chunk_paths="$RUNNER_TEMP/adversarial-review-paths-${index}.txt"
+            # A failure to extract the path list is NO VERDICT with a named
+            # stage, never `unclassified`: the scope could not be computed.
+            if ! jq -r --argjson index "$index" '
+              .chunks[] | select(.index == $index)
+              | (.context.file_header // ""), (.context.hunk_header // ""),
+                ((.context.source_contexts // [])[] | .path // "")
+            ' "$MANIFEST_FILE" > "$chunk_paths"; then
+              printf 'Adversarial review chunk %s/%s: could not extract file paths for the security scope\n' \
+                "$index" "$chunk_count" >&2
+              record_failure_stage "security-scope" "chunk=${index}/${chunk_count}"
+              exit 1
+            fi
+            if chunk_touches_security "$chunk" "$chunk_paths"; then
+              content_security=true
+            fi
+            # The decision is STAMPED INTO the runner-owned result record, so the
+            # manifest counts exactly what the loop decided (one definition, not
+            # two that can drift) and a re-review cannot be skipped silently.
+            security_result="$result.security"
+            jq -cS --argjson content_security "$content_security" '
+              .security_partial = (
+                .coverage_complete == false
+                and .verdict == "pass"
+                and .injection_detected == false
+                and ($content_security
+                     or any(.interface_facts[];
+                            .kind == "auth" or .role == "guards"
+                            or .role == "removes"))
+              )
+            ' "$result" > "$security_result"
+            mv -- "$security_result" "$result"
+            chmod 0600 "$result"
+            security_partial="$(jq -r .security_partial "$result")"
+            if [ "$security_partial" = "true" ]; then
+              if [ "$rereview_pass" -eq 0 ]; then
+                printf 'Adversarial review chunk %s/%s: coverage_complete=false with security-relevant interface facts; running one security re-review before deciding\n' \
+                  "$index" "$chunk_count" >&2
+                security_rereviews=$((security_rereviews + 1))
+                rereview_pass=1
+                # Re-enter this chunk: nothing from the first sample has been
+                # counted, appended to the transcript or published.
+                index=$((index - 1))
+                continue
+              fi
+              security_partial_unresolved=$((security_partial_unresolved + 1))
+              printf 'Adversarial review chunk %s/%s: coverage_complete=false on a security-relevant interface could not be resolved by the security re-review\n' \
+                "$index" "$chunk_count" >&2
+            elif [ "$rereview_pass" -eq 1 ]; then
+              # Re-review outcome, for measuring the clear rate on real PRs.
+              if [ "$(jq -r .verdict "$result")" = "pass" ]; then
+                security_rereviews_cleared=$((security_rereviews_cleared + 1))
+              else
+                security_rereviews_failed=$((security_rereviews_failed + 1))
+              fi
+            fi
+            rereview_pass=0
             interface_fact_count="$(jq -er '.interface_facts | length' "$result")"
             interface_facts_total=$((interface_facts_total + interface_fact_count))
             test "$interface_facts_total" -le 32 || {
@@ -5510,11 +5659,14 @@ jobs:
             # and the per-field byte limits legitimately force an honest
             # reviewer to report coverage_complete=false on a complex diff.
             # Failing the run for that punished honesty and silently killed the
-            # gate. Keep partial coverage in the diagnostic manifest, but the
-            # terminal PASS gate below requires complete coverage.
+            # gate. Partial coverage is ADVISORY evidence: it is carried into the
+            # manifest and published, and blocks only when a security-relevant
+            # partial chunk stays unresolved after its one security re-review
+            # (terminal gate below; rule 4 in the comment at the loop head).
             if [ "$coverage" != "true" ]; then
               partial_coverage=true
-              printf 'Adversarial review chunk %s/%s: coverage_complete=false (partial coverage recorded, verdict still %s)\n' \
+              partial_coverage_chunks=$((partial_coverage_chunks + 1))
+              printf 'Adversarial review chunk %s/%s: coverage_complete=false (partial coverage recorded as advisory, verdict still %s)\n' \
                 "$index" "$chunk_count" "$verdict" >&2
             fi
             # Pace successive inference calls to stay inside org rate limits.
@@ -5523,6 +5675,9 @@ jobs:
 
           # Post-loop aggregates, named on failure for the same reason as the
           # per-chunk gates above.
+          printf 'Adversarial review security re-review outcomes: cleared=%s unresolved=%s failed=%s\n' \
+            "$security_rereviews_cleared" "$security_partial_unresolved" \
+            "$security_rereviews_failed" >&2
           fail_aggregate_assertion() {
             printf 'Adversarial review failed aggregate assertion: %s\n' "$1" >&2
             # `aggregate-assertion` is a TOOLING failure: a bound this runner
@@ -5910,10 +6065,15 @@ jobs:
             --argjson chunk_summaries_bytes "$chunk_summaries_bytes" \
             --arg chunk_summaries_sha256 "$chunk_summaries_sha256" \
             --argjson partial_coverage "$partial_coverage" \
+            --argjson partial_coverage_chunks "$partial_coverage_chunks" \
+            --argjson security_rereviews "$security_rereviews" \
+            --argjson security_rereviews_cleared "$security_rereviews_cleared" \
+            --argjson security_rereviews_failed "$security_rereviews_failed" \
             --argjson merit_confirmations "$merit_confirmations" \
             --argjson merit_disagreements "$merit_disagreements" \
             --argjson chunk_merit_failures "$chunk_merit_failures" \
             --slurpfile manifest "$MANIFEST_FILE" '
+            . as $chunk_results |
             $manifest[0] as $review |
             {
               protocol: $review.protocol,
@@ -5938,6 +6098,14 @@ jobs:
               interface_ledger_sha256: $interface_ledger_sha256,
               interface_fact_count: $interface_fact_count,
               partial_coverage: $partial_coverage,
+              partial_coverage_chunks: $partial_coverage_chunks,
+              security_rereviews: $security_rereviews,
+              security_rereviews_cleared: $security_rereviews_cleared,
+              security_rereviews_failed: $security_rereviews_failed,
+              chunk_security_partial: [$chunk_results[] | .security_partial],
+              unresolved_security_partial_chunks: (
+                [$chunk_results[] | select(.security_partial == true)] | length
+              ),
               merit_confirmations: $merit_confirmations,
               merit_disagreements: $merit_disagreements,
               chunk_merit_failures: $chunk_merit_failures,
@@ -5946,7 +6114,7 @@ jobs:
               chunk_reviews: .
             }
           ' "$result_dir"/[0-9][0-9][0-9][0-9].json > "$review_manifest"
-          jq -e '
+          jq -e --argjson security_partial_unresolved "$security_partial_unresolved" '
             . as $review
             | ($review.chunk_reviews | length) == $review.chunk_count
             and (
@@ -5975,6 +6143,35 @@ jobs:
             and (
               $review.partial_coverage
               == (any($review.chunk_reviews[]; .coverage_complete != true))
+            )
+            # ADVISORY COVERAGE ACCOUNTING, exact like the verdict accounting
+            # above: the count of partial chunks and of unresolved
+            # security-relevant partial chunks must equal what the manifest
+            # chunk records show and what the loop observed.
+            and all($review.chunk_reviews[]; .security_partial | type == "boolean")
+            and (
+              $review.partial_coverage_chunks
+              == ([$review.chunk_reviews[] | select(.coverage_complete != true)]
+                  | length)
+            )
+            and ($review.partial_coverage == ($review.partial_coverage_chunks > 0))
+            and ($review.security_rereviews
+                 | type == "number" and floor == . and . >= 0 and . <= 72)
+            and ($review.unresolved_security_partial_chunks
+                 | type == "number" and floor == . and . >= 0 and . <= 72)
+            and $review.unresolved_security_partial_chunks
+                == $security_partial_unresolved
+            and (
+              $review.chunk_security_partial
+              == [$review.chunk_reviews[] | .security_partial]
+            )
+            and ($review.security_rereviews_cleared | type == "number" and . >= 0)
+            and ($review.security_rereviews_failed | type == "number" and . >= 0)
+            and (
+              $review.security_rereviews_cleared
+              + $review.security_rereviews_failed
+              + $review.unresolved_security_partial_chunks
+              == $review.security_rereviews
             )
             # Confirm-on-fail accounting. Every disagreement is a confirmation
             # whose second sample voted pass, so disagreements can never exceed
@@ -6682,10 +6879,21 @@ jobs:
             fi
             exit 1
           fi
-          # Incomplete coverage is not a safety verdict. It cannot authorize
-          # PASS even when every sampled judgement returned pass.
+          # PARTIAL COVERAGE IS ADVISORY, EXCEPT WHERE IT COULD HIDE A FINDING.
+          # Plain partial_coverage=true is recorded in the evidence and may
+          # PASS (rule 5). A security-relevant partial chunk that the one
+          # security re-review could not resolve is not a verdict either way:
+          # NO VERDICT, fail closed, published nowhere (rule 4). Evaluated after
+          # the merit gate above so a real objection is reported as FAIL.
+          if [ "$security_partial_unresolved" -gt 0 ]; then
+            printf 'Adversarial review: %s chunk(s) reported partial coverage on a security-relevant interface that could not be resolved by the security re-review; the reviewer cannot conclude.\n' \
+              "$security_partial_unresolved" >&2
+            record_failure_stage "coverage-unresolved"
+            exit 1
+          fi
           if [ "$partial_coverage" != "false" ]; then
-            fail_aggregate_assertion "partial_coverage=${partial_coverage}; incomplete review cannot produce PASS"
+            printf 'Adversarial review: partial coverage on %s chunk(s) recorded as advisory evidence (no security-relevant interface was left unresolved)\n' \
+              "$partial_coverage_chunks" >&2
           fi
           # A run that reaches here resolved every re-sampled judgement to pass,
           # so the two counters are equal by construction. Asserted, not assumed:
@@ -6886,6 +7094,14 @@ jobs:
               chunk-assertion|aggregate-assertion)
                 echo "Adversarial review: the reviewer did NOT reach a verdict; one of its own bounds was exceeded (stage=${stage})." >&2
                 echo "This is a reviewer/tooling failure, NOT a finding about this change." >&2
+                ;;
+              security-scope)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; the file paths for the security scope could not be extracted from the chunk manifest (stage=${stage})." >&2
+                echo "This is a reviewer/tooling failure, NOT a finding about this change." >&2
+                ;;
+              coverage-unresolved)
+                echo "Adversarial review: the reviewer did NOT reach a verdict; a chunk reported partial coverage on a security-relevant interface and the one security re-review could not resolve it (stage=${stage})." >&2
+                echo "This is NOT a finding about this change, and partial coverage by itself never blocks. Re-run, or split the change so the security-relevant hunk is reviewed with more room." >&2
                 ;;
               source-exceeds-admission|chunks-exceeds-admission)
                 echo "Adversarial review: the pull request exceeds admission limits (stage=${stage})." >&2
@@ -7146,7 +7362,39 @@ jobs:
               | type == "number" and . >= 0 and . <= 32 and floor == .
             )
             and (.review.partial_coverage | type == "boolean")
-            and .review.partial_coverage == false
+            and (
+              .review.partial_coverage_chunks
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and (
+              .review.partial_coverage
+              == (.review.partial_coverage_chunks > 0)
+            )
+            and (
+              .review.security_rereviews
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and .review.unresolved_security_partial_chunks == 0
+            # RE-DERIVED, not only trusted: every per-chunk stamp must be false,
+            # there is one stamp per chunk, and the outcomes add up.
+            and (.review.chunk_security_partial | length) == .review.chunk_count
+            and all(.review.chunk_security_partial[]; . == false)
+            # Where the full chunk records are present, re-derive from them too.
+            and all(.review.chunk_reviews[]?; .security_partial == false)
+            and (
+              .review.security_rereviews_failed
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and (
+              .review.security_rereviews_cleared
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and (
+              .review.security_rereviews_cleared
+              + .review.security_rereviews_failed
+              + .review.unresolved_security_partial_chunks
+              == .review.security_rereviews
+            )
             and .review.chunk_merit_failures == 0
             # PUBLICATION INVARIANT for confirm-on-fail: a run may only publish
             # when every judgement that was re-sampled resolved to `pass`, i.e.
@@ -7626,7 +7874,39 @@ jobs:
               | type == "number" and . >= 0 and . <= 32 and floor == .
             )
             and (.review.partial_coverage | type == "boolean")
-            and .review.partial_coverage == false
+            and (
+              .review.partial_coverage_chunks
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and (
+              .review.partial_coverage
+              == (.review.partial_coverage_chunks > 0)
+            )
+            and (
+              .review.security_rereviews
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and .review.unresolved_security_partial_chunks == 0
+            # RE-DERIVED, not only trusted: every per-chunk stamp must be false,
+            # there is one stamp per chunk, and the outcomes add up.
+            and (.review.chunk_security_partial | length) == .review.chunk_count
+            and all(.review.chunk_security_partial[]; . == false)
+            # Where the full chunk records are present, re-derive from them too.
+            and all(.review.chunk_reviews[]?; .security_partial == false)
+            and (
+              .review.security_rereviews_failed
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and (
+              .review.security_rereviews_cleared
+              | type == "number" and . >= 0 and . <= 72 and floor == .
+            )
+            and (
+              .review.security_rereviews_cleared
+              + .review.security_rereviews_failed
+              + .review.unresolved_security_partial_chunks
+              == .review.security_rereviews
+            )
             and .review.chunk_merit_failures == 0
             # PUBLICATION INVARIANT for confirm-on-fail: a run may only publish
             # when every judgement that was re-sampled resolved to `pass`, i.e.
@@ -7691,6 +7971,30 @@ jobs:
             = "$(jq -er .review.interface_ledger_sha256 "$response_manifest")"
 
 
+          # Advisory coverage accounting rides in the evidence beside the flag.
+          # Both values were already range-checked by the revalidation above;
+          # the digit test here only keeps a malformed value out of --argjson.
+          partial_coverage_chunks="$(jq -r '
+            .review.partial_coverage_chunks | select(type == "number") | tostring
+          ' "$response_manifest")"
+          security_rereviews="$(jq -r '
+            .review.security_rereviews | select(type == "number") | tostring
+          ' "$response_manifest")"
+          security_rereviews_cleared="$(jq -r '
+            .review.security_rereviews_cleared | select(type == "number") | tostring
+          ' "$response_manifest")"
+          security_rereviews_failed="$(jq -r '
+            .review.security_rereviews_failed | select(type == "number") | tostring
+          ' "$response_manifest")"
+          security_rereviews_unresolved="$(jq -r '
+            .review.unresolved_security_partial_chunks | select(type == "number") | tostring
+          ' "$response_manifest")"
+          [[ "$security_rereviews_cleared" =~ ^[0-9]{1,2}$ ]]
+          [[ "$security_rereviews_failed" =~ ^[0-9]{1,2}$ ]]
+          [[ "$security_rereviews_unresolved" =~ ^[0-9]{1,2}$ ]]
+          [[ "$partial_coverage_chunks" =~ ^[0-9]{1,2}$ ]]
+          [[ "$security_rereviews" =~ ^[0-9]{1,2}$ ]]
+
           # Read from the manifest whose digest this job has already verified,
           # so the published flag cannot disagree with the reviewed evidence.
           #
@@ -7736,6 +8040,11 @@ jobs:
           esac
           evidence="$(jq -cn \
             --argjson partial_coverage "$partial_coverage" \
+            --argjson partial_coverage_chunks "$partial_coverage_chunks" \
+            --argjson security_rereviews "$security_rereviews" \
+            --argjson security_rereviews_cleared "$security_rereviews_cleared" \
+            --argjson security_rereviews_failed "$security_rereviews_failed" \
+            --argjson security_rereviews_unresolved "$security_rereviews_unresolved" \
             --arg repository "$GITHUB_REPOSITORY" \
             --argjson pull_request "$PR_NUMBER" \
             --arg base_ref "$EXPECTED_BASE_REF" \
@@ -7775,6 +8084,13 @@ jobs:
               run_attempt: $run_attempt,
               verdict: "PASS",
               partial_coverage: $partial_coverage,
+              partial_coverage_chunks: $partial_coverage_chunks,
+              security_rereviews: $security_rereviews,
+              security_rereview_outcomes: {
+                cleared: $security_rereviews_cleared,
+                unresolved: $security_rereviews_unresolved,
+                failed: $security_rereviews_failed
+              },
               merge_authority: "none"
             }
           ')"
